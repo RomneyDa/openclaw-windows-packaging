@@ -67,7 +67,7 @@ jobs:
             & ./scripts/Build-MSIX.ps1 @build
             if (-not (Test-Path (Join-Path $unsigned 'OpenClawGateway-arm64.msix') -PathType Leaf)) { throw 'The native package owner did not produce the candidate.' }
           }
-          Invoke-LocalPackageMsixBuild -RepositoryRoot $root -Architecture arm64 -PayloadRunId 38964560015 -Compose $compose
+          Invoke-LocalPackageMsixBuild -RepositoryRoot $root -Architecture arm64 -PayloadRunId 38845646589 -Compose $compose
           & ./scripts/Sign-TestMSIX.ps1 -ArtifactsDirectory $unsignedRoot -OutputDirectory $signedRoot -IdentityChannel sideload
           $metadata = Get-Content (Join-Path $signed 'msix-metadata.json') -Raw | ConvertFrom-Json
           if ($metadata.packagingCommit -cne $commit -or $metadata.sourceTreeDirty -or $metadata.payloadResolvedCommit -cne '383c124cc32ffee3f8e56f549b88da94d269a4af' -or $metadata.packageVersion -cne $identity.PackageVersion -or $metadata.packageFamilyName -cne $policy.sideloadPackageIdentity.familyName -or $metadata.identityChannel -cne 'sideload' -or $metadata.architecture -cne 'arm64' -or $metadata.signingType -cne 'test' -or -not $metadata.signed) { throw 'Candidate metadata does not match the frozen proof inputs.' }
@@ -83,7 +83,7 @@ jobs:
             sourceCommit = $commit
             srcTree = $srcTree
             pluginTree = $pluginTree
-            payloadRunId = 38964560015
+            payloadRunId = 38845646589
             payloadCommit = $metadata.payloadResolvedCommit
             releaseTag = $identity.ReleaseTag
             packageVersion = $identity.PackageVersion
