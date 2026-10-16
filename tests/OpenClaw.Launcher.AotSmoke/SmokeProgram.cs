@@ -1,3 +1,5 @@
+using System.ComponentModel;
+using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Text.Json;
 using OpenClaw.Launcher.Gateway;
@@ -55,7 +57,9 @@ internal static class SmokeProgram
             ("Companion snapshot and patch survive NativeAOT", CompanionSnapshotAndPatchAreStructured),
             ("Spectre renders clawctl output under NativeAOT", SpectreOutputRenders),
             ("gateway narration survives NativeAOT", GatewayNarrationRenders),
+            ("pending gateway JSON survives NativeAOT", PendingGatewayJsonIsStructured),
             ("Windows logon identity survives NativeAOT", WindowsLogonIdentityWorks),
+            ("Windows process identity survives NativeAOT", WindowsProcessIdentityWorks),
             ("package provenance reads survive NativeAOT", PackageProvenanceReadsBind),
             ("diagnostics redaction survives NativeAOT", DiagnosticsRedactionWorks),
             ("missing application reports diagnostics", MissingApplicationReportsAsync),
@@ -106,6 +110,35 @@ internal static class SmokeProgram
             id.Length == 17 && id[8] == ':' &&
             id.Where(character => character != ':').All(Uri.IsHexDigit),
             $"Unexpected Windows logon identity '{id}'.");
+        return Task.CompletedTask;
+    }
+
+    // Read-only native queries exercise the same interop as guest inspection.
+    // A synthetic denial tests reconciliation without modifying any process DACL.
+    private static Task WindowsProcessIdentityWorks()
+    {
+        using Process process = Process.GetCurrentProcess();
+        using var handle = SessionProcessQuery.Open(process.Id);
+        DateTimeOffset created = SessionProcessQuery.StartTime(handle);
+        Assert(!SessionProcessQuery.HasExited(handle), "The running driver was reported as exited.");
+        Assert(created == process.StartTime.ToUniversalTime(), "The pinned creation time changed.");
+        Assert(string.Equals(SessionProcessQuery.ImagePath(handle), Environment.ProcessPath,
+            StringComparison.OrdinalIgnoreCase), "The pinned process image did not match the driver.");
+        Assert(WindowsProcessSnapshot.CaptureCreationTimes()[process.Id] == created,
+            "The OS process table disagreed with the pinned identity.");
+
+        var request = new SessionInspectRequest
+        {
+            RequestId = "aot-process-identity",
+            ProcessId = process.Id,
+            ProcessStartTimeUtc = created
+        };
+        SessionInspectResult owned = SessionInspector.ReconcileAccessDenied(request, new Win32Exception(5), null);
+        Assert(owned.Error is not null, "Access denial discarded a matching process identity.");
+        SessionInspectResult reused = SessionInspector.ReconcileAccessDenied(
+            request with { ProcessStartTimeUtc = created.AddTicks(-1) }, new Win32Exception(5), null);
+        Assert(reused.Error is null && reused.ProcessFound && !reused.StartTimeMatches,
+            "OS creation-time mismatch did not permit stale-record recovery.");
         return Task.CompletedTask;
     }
 
@@ -432,20 +465,30 @@ internal static class SmokeProgram
 
     private static async Task JsonFailureIsStructuredAsync()
     {
-        using Fixture fixture = Fixture.CreateWithoutApplication();
+        foreach (string command in new[] { "setup", "status" })
+        {
+            using Fixture fixture = Fixture.CreateWithoutApplication();
 
-        int exitCode = await fixture.RunAsync(["setup", "--json"]).ConfigureAwait(false);
+            int exitCode = await fixture.RunAsync([command, "--json"]).ConfigureAwait(false);
 
-        AssertExitCode(1, exitCode, fixture);
-        using JsonDocument document = JsonDocument.Parse(fixture.Output.ToString());
-        JsonElement root = document.RootElement;
-        Assert(!root.GetProperty("ok").GetBoolean(), "The JSON failure reported success.");
-        Assert(
-            root.GetProperty("schemaVersion").GetInt32() == 1,
-            "The JSON failure did not report schema version 1.");
-        Assert(
-            root.GetProperty("error").GetProperty("type").GetString() == "cli_error",
-            "The JSON failure did not use the cli_error envelope.");
+            AssertExitCode(1, exitCode, fixture);
+            using JsonDocument document = JsonDocument.Parse(fixture.Output.ToString());
+            JsonElement root = document.RootElement;
+            Assert(!root.GetProperty("ok").GetBoolean(), "The JSON failure reported success.");
+            Assert(
+                root.GetProperty("schemaVersion").GetInt32() == 1,
+                "The JSON failure did not report schema version 1.");
+            Assert(
+                root.GetProperty("error").GetProperty("type").GetString() == "cli_error",
+                "The JSON failure did not use the cli_error envelope.");
+            Assert(root.GetProperty("command").GetString() == command,
+                "The JSON failure lost the selected command.");
+            Assert(root.GetProperty("integration").GetProperty("kind").GetString() == "isolated-session" &&
+                root.GetProperty("integration").GetProperty("version").GetInt32() == 1,
+                "The JSON failure hid the package's isolated-session capability.");
+            Assert(!root.TryGetProperty("session", out _) && !root.TryGetProperty("companion", out _),
+                "The JSON failure fabricated session readiness or Companion credentials.");
+        }
     }
 
     // Spectre.Console composes the renderables; this proves the composition,
@@ -580,6 +623,35 @@ internal static class SmokeProgram
         Assert(
             result.ToString().Contains("http://127.0.0.1:18789/", StringComparison.Ordinal),
             "The gateway result did not report its URL.");
+    }
+
+    private static Task PendingGatewayJsonIsStructured()
+    {
+        foreach (string action in new[] { "start", "restart" })
+        {
+            using var output = new StringWriter();
+            ClawCtlJson.WriteResult(output, new GatewayCommandResult(
+                action,
+                GatewayState.Starting,
+                "The supervised gateway launch was accepted.",
+                null,
+                0));
+            using JsonDocument document = JsonDocument.Parse(output.ToString());
+            JsonElement root = document.RootElement;
+            JsonElement gateway = root.GetProperty("gateway");
+            Assert(root.GetProperty("ok").GetBoolean(), "An accepted launch was reported as failed.");
+            Assert(root.GetProperty("schemaVersion").GetInt32() == 1, "The JSON schema version changed.");
+            Assert(root.GetProperty("command").GetString() == $"gateway-service {action}",
+                "The accepted launch lost its command identity.");
+            Assert(gateway.GetProperty("state").GetString() == "starting",
+                "The pending gateway state did not survive NativeAOT.");
+            Assert(!gateway.TryGetProperty("port", out _) &&
+                !gateway.TryGetProperty("url", out _) &&
+                !gateway.TryGetProperty("ownership", out _) &&
+                !root.TryGetProperty("error", out _),
+                "Pending acceptance claimed readiness or reported an error.");
+        }
+        return Task.CompletedTask;
     }
 
     private static string StripAnsi(string value)

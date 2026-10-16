@@ -18,6 +18,9 @@ on:
       payload_artifact:
         type: string
         required: true
+      bundle_build:
+        type: string
+        required: true
       cache_write:
         description: Avoid explicit saves on the read-only route; the caller token cap is authoritative
         type: boolean
@@ -317,9 +320,10 @@ jobs:
             -p:Platform='${{ matrix.architecture }}'
           if ($LASTEXITCODE -ne 0) { throw 'Session host restore failed.' }
 
-      - name: Compose unsigned Store and sideload MSIX packages
+      - name: Compose unsigned Gateway MSIX packages
         shell: pwsh
         env:
+          BUILD_STORE_PACKAGE: ${{ github.event_name != 'pull_request' || inputs.bundle_build == 'true' || inputs.versioning == 'true' }}
           SIGNING_MODE: ${{ inputs.signing_mode }}
           VERSIONING_CHANGE: ${{ inputs.versioning }}
           GATEWAY_TAG: ${{ needs.build-package.outputs.release_identity_tag }}
@@ -342,16 +346,23 @@ jobs:
           $packageVersion = .\scripts\Get-WorkflowPackageVersion.ps1 `
             @versionParameters
 
-          .\scripts\Build-MSIX.ps1 `
-            -PayloadDirectory '${{ runner.temp }}\openclaw-payload' `
-            -Architecture '${{ matrix.architecture }}' `
-            -PackageVersion $packageVersion `
-            -SourceCommit '${{ github.sha }}' `
-            -IdentityChannel Store `
-            -OutputDirectory '${{ runner.temp }}\openclaw-msix-store' `
-            -SideloadOutputDirectory '${{ runner.temp }}\openclaw-msix-sideload'
+          $packageParameters = @{
+            PayloadDirectory = '${{ runner.temp }}\openclaw-payload'
+            Architecture = '${{ matrix.architecture }}'
+            PackageVersion = $packageVersion
+            SourceCommit = '${{ github.sha }}'
+            IdentityChannel = 'Sideload'
+            OutputDirectory = '${{ runner.temp }}\openclaw-msix-sideload'
+          }
+          if ($env:BUILD_STORE_PACKAGE -eq 'true') {
+            $packageParameters.IdentityChannel = 'Store'
+            $packageParameters.OutputDirectory = '${{ runner.temp }}\openclaw-msix-store'
+            $packageParameters.SideloadOutputDirectory = '${{ runner.temp }}\openclaw-msix-sideload'
+          }
+          .\scripts\Build-MSIX.ps1 @packageParameters
 
       - name: Upload unsigned Store MSIX
+        if: ${{ github.event_name != 'pull_request' || inputs.bundle_build == 'true' || inputs.versioning == 'true' }}
         uses: actions/upload-artifact@v7
         with:
           name: openclaw-gateway-msix-store-unsigned-${{ matrix.architecture }}
@@ -373,6 +384,7 @@ jobs:
 
   build-msix-bundle:
     name: Build unsigned Store and sideload Gateway MSIX bundles
+    if: ${{ github.event_name != 'pull_request' || inputs.bundle_build == 'true' || inputs.versioning == 'true' }}
     needs:
       - build-package
       - build-msix
@@ -441,7 +453,6 @@ jobs:
           }
 
       - name: Upload unsigned Store MSIX bundle
-        if: ${{ github.event_name != 'pull_request' || inputs.versioning == 'true' }}
         uses: actions/upload-artifact@v7
         with:
           name: openclaw-gateway-msix-store-unsigned-bundle
@@ -450,7 +461,6 @@ jobs:
           retention-days: 7
 
       - name: Upload unsigned sideload MSIX bundle
-        if: ${{ github.event_name != 'pull_request' || inputs.versioning == 'true' }}
         uses: actions/upload-artifact@v7
         with:
           name: openclaw-gateway-msix-sideload-unsigned-bundle
@@ -475,9 +485,13 @@ jobs:
         shell: pwsh
         env:
           RESULTS: ${{ toJSON(needs) }}
+          BUNDLE_EXPECTED: ${{ github.event_name != 'pull_request' || inputs.bundle_build == 'true' || inputs.versioning == 'true' }}
         run: |
           $results = $env:RESULTS | ConvertFrom-Json
           foreach ($job in $results.PSObject.Properties) {
+            if ($job.Name -ceq 'build-msix-bundle' -and $env:BUNDLE_EXPECTED -cne 'true' -and $job.Value.result -ceq 'skipped') {
+              continue
+            }
             if ($job.Value.result -cne 'success') {
               throw "The shared build stage $($job.Name) did not succeed."
             }

@@ -10,7 +10,11 @@ param(
     [Parameter(Mandatory, ParameterSetName = 'PathList')]
     [string]$PathListPath,
 
-    [switch]$PayloadArtifact
+    [switch]$PayloadArtifact,
+
+    [switch]$BundleBuild,
+
+    [switch]$Versioning
 )
 
 Set-StrictMode -Version Latest
@@ -30,6 +34,44 @@ $payloadArtifactPaths = @(
     'scripts/Get-WorkflowSource.ps1'
     'scripts/OpenClawSource.ps1'
 )
+# Bundles only add the architecture packages to one delivery archive. Rebuild
+# them when composition or a child package's bundle-facing manifest can change;
+# standalone MSIX composition proves every other package-content change.
+$bundleBuildPaths = @(
+    '.github/workflows/gateway-msix.yml'
+    'scripts/Build-MSIX.ps1'
+    'scripts/Build-MSIXBundle.ps1'
+    'src/OpenClaw.Launcher/Package.appxmanifest'
+)
+$versioningPaths = @(
+    '.github/workflows/gateway-msix.yml'
+    '.github/workflows/gateway-msix-build.yml'
+    'release-policy.json'
+    'scripts/Sign-TestMSIX.ps1'
+    'scripts/OpenClawSource.ps1'
+    'scripts/Get-WorkflowSource.ps1'
+    'scripts/Test-OpenClawSource.Tests.ps1'
+    'scripts/Get-MSIXReleaseIdentity.ps1'
+    'scripts/Get-MSIXUpgradeMatrix.ps1'
+    'scripts/Test-MSIXReleaseIdentity.Tests.ps1'
+    'scripts/Test-MSIXStoreUpgrade.ps1'
+    'scripts/Test-MSIXUpgrade.ps1'
+    'scripts/Test-MSIXUpgradeMatrix.Tests.ps1'
+    'scripts/Test-WorkflowSigningConfiguration.ps1'
+    'scripts/Select-WorkflowBuild.ps1'
+    'scripts/Assert-WorkflowJobResults.ps1'
+    'scripts/Test-WorkflowJobResults.Tests.ps1'
+    'scripts/msix-upgrade-baselines.json'
+)
+
+$selectedModes = (
+    [int][bool]$PayloadArtifact +
+    [int][bool]$BundleBuild +
+    [int][bool]$Versioning
+)
+if ($selectedModes -gt 1) {
+    throw 'PayloadArtifact, BundleBuild, and Versioning are mutually exclusive.'
+}
 
 function Test-RelevantPath {
     param([string]$Path)
@@ -42,6 +84,12 @@ function Test-RelevantPath {
                 [StringComparison]::Ordinal
             )
         )
+    }
+    if ($BundleBuild) {
+        return $Path -in $bundleBuildPaths
+    }
+    if ($Versioning) {
+        return $Path -in $versioningPaths
     }
     return $Path -notmatch $documentationPathPattern
 }

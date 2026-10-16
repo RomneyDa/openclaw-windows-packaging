@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       openclaw_ref:
-        description: Empty follows stable; store/official also accept a full SHA matching stable; other refs are unsigned/test only
+        description: Optional OpenClaw branch, tag, or full SHA to package; empty follows stable
         required: false
         default: ''
         type: string
@@ -54,6 +54,7 @@ jobs:
     outputs:
       packaging: ${{ steps.filter.outputs.packaging }}
       payload_artifact: ${{ steps.filter.outputs.payload_artifact }}
+      bundle_build: ${{ steps.filter.outputs.bundle_build }}
       versioning: ${{ steps.filter.outputs.versioning }}
       upgrade_matrix: ${{ steps.filter.outputs.upgrade_matrix }}
     steps:
@@ -68,6 +69,7 @@ jobs:
           if ($env:GITHUB_EVENT_NAME -ne 'pull_request') {
             'packaging=true' >> $env:GITHUB_OUTPUT
             'payload_artifact=true' >> $env:GITHUB_OUTPUT
+            'bundle_build=true' >> $env:GITHUB_OUTPUT
             'versioning=false' >> $env:GITHUB_OUTPUT
             return
           }
@@ -86,42 +88,23 @@ jobs:
             -FileListPath $fileListPath
           "packaging=$packaging" >> $env:GITHUB_OUTPUT
 
-          $pages = Get-Content -LiteralPath $fileListPath -Raw |
-            ConvertFrom-Json
           $payloadArtifact = .\scripts\Get-PackagingRelevance.ps1 `
             -FileListPath $fileListPath `
             -PayloadArtifact
           "payload_artifact=$payloadArtifact" >> $env:GITHUB_OUTPUT
 
-          $versioningPaths = @(
-            '.github/workflows/gateway-msix.yml'
-            '.github/workflows/gateway-msix-build.yml'
-            'scripts/Select-WorkflowBuild.ps1'
-            'release-policy.json'
-            'scripts/Sign-TestMSIX.ps1'
-            'scripts/OpenClawSource.ps1'
-            'scripts/Get-WorkflowSource.ps1'
-            'scripts/Test-OpenClawSource.Tests.ps1'
-            'scripts/Get-MSIXReleaseIdentity.ps1'
-            'scripts/Get-MSIXUpgradeMatrix.ps1'
-            'scripts/Test-MSIXReleaseIdentity.Tests.ps1'
-            'scripts/Test-MSIXStoreUpgrade.ps1'
-            'scripts/Test-MSIXUpgrade.ps1'
-            'scripts/Test-MSIXUpgradeMatrix.Tests.ps1'
-            'scripts/Assert-WorkflowJobResults.ps1'
-            'scripts/Test-WorkflowJobResults.Tests.ps1'
-            'scripts/Test-WorkflowSigningConfiguration.ps1'
-            'scripts/msix-upgrade-baselines.json'
-          )
-          $versioning = 'false'
-          foreach ($page in @($pages)) {
-            foreach ($file in @($page)) {
-              if ([string]$file.filename -in $versioningPaths) {
-                $versioning = 'true'
-              }
-            }
-          }
+          $versioning = .\scripts\Get-PackagingRelevance.ps1 `
+            -FileListPath $fileListPath `
+            -Versioning
           "versioning=$versioning" >> $env:GITHUB_OUTPUT
+
+          $bundleBuild = $versioning
+          if ($bundleBuild -ne 'true') {
+            $bundleBuild = .\scripts\Get-PackagingRelevance.ps1 `
+              -FileListPath $fileListPath `
+              -BundleBuild
+          }
+          "bundle_build=$bundleBuild" >> $env:GITHUB_OUTPUT
 
           $upgradeMatrix = .\scripts\Get-MSIXUpgradeMatrix.ps1
           "upgrade_matrix=$upgradeMatrix" >> $env:GITHUB_OUTPUT
@@ -305,7 +288,7 @@ jobs:
         run: >
           .\scripts\Test-Measure-Coverage.Tests.ps1
 
-      - name: Test stable source selection
+      - name: Test OpenClaw source selection
         shell: pwsh
         run: .\scripts\Test-OpenClawSource.Tests.ps1
 
@@ -423,6 +406,82 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+  cache-proof-write:
+    name: Prove cache service permits trusted writes
+    needs: changes
+    if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.versioning == 'true' }}
+    runs-on: ubuntu-latest
+    cache-mode: write
+    permissions:
+      contents: read
+    steps:
+      - name: Create synthetic cache content
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'cache-capability-proof'
+          [IO.Directory]::CreateDirectory($root) | Out-Null
+          [IO.File]::WriteAllText((Join-Path $root 'value.txt'), 'openclaw-cache-capability-proof')
+
+      - name: Persist a cache with a write-capable token
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/cache-capability-proof
+          key: openclaw-cache-proof-${{ github.run_id }}-${{ github.run_attempt }}-allowed
+
+  cache-proof-read:
+    name: Prove cache service rejects read-token writes
+    needs: [changes, cache-proof-write]
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.changes.outputs.versioning == 'true' && needs.cache-proof-write.result == 'success' }}
+    runs-on: ubuntu-latest
+    cache-mode: read
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Restore the trusted cache
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/cache-capability-proof
+          key: openclaw-cache-proof-${{ github.run_id }}-${{ github.run_attempt }}-allowed
+          fail-on-cache-miss: true
+
+      - name: Verify persisted content
+        shell: pwsh
+        run: |
+          $path = Join-Path $env:RUNNER_TEMP 'cache-capability-proof/value.txt'
+          if ([IO.File]::ReadAllText($path) -cne 'openclaw-cache-capability-proof') {
+            throw 'The write-capable job did not persist the expected cache bytes.'
+          }
+
+      # Deliberately bypass the cache client's mode guard. Only the service's
+      # scoped token may prevent this otherwise ordinary cache save.
+      - name: Attempt a write after forging the client mode
+        uses: actions/cache/save@v4
+        env:
+          ACTIONS_CACHE_MODE: write
+        with:
+          path: ${{ runner.temp }}/cache-capability-proof
+          key: openclaw-cache-proof-${{ github.run_id }}-${{ github.run_attempt }}-denied
+
+      - name: Require service-side write denial
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const prefix = `openclaw-cache-proof-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}`;
+            const result = await github.rest.actions.getActionsCacheList({
+              ...context.repo, ref: context.ref, key: `${prefix}-denied`
+            });
+            if (result.data.total_count !== 0) {
+              throw new Error('A read-scoped token persisted a cache after its client mode was forged.');
+            }
+            await core.summary.addHeading('Cache service capability proof')
+              .addTable([
+                [{data: 'Operation', header: true}, {data: 'Observed result', header: true}],
+                ['Write-capable token, then independent restore', 'Exact synthetic bytes retained'],
+                ['Read-scoped token with ACTIONS_CACHE_MODE=write', 'No cache persisted']
+              ]).addRaw(`Cache namespace: ${prefix}; workflow ref: ${context.ref}`).write();
+
   build-trusted:
     name: Build with write cache access
     needs: [changes, source-preflight]
@@ -437,6 +496,7 @@ jobs:
       signing_mode: ${{ inputs.signing_mode || 'unsigned' }}
       versioning: ${{ needs.changes.outputs.versioning }}
       payload_artifact: ${{ needs.changes.outputs.payload_artifact }}
+      bundle_build: ${{ needs.changes.outputs.bundle_build }}
       cache_write: true
 
   build-read-only:
@@ -453,6 +513,7 @@ jobs:
       signing_mode: ${{ inputs.signing_mode || 'unsigned' }}
       versioning: ${{ needs.changes.outputs.versioning }}
       payload_artifact: ${{ needs.changes.outputs.payload_artifact }}
+      bundle_build: ${{ needs.changes.outputs.bundle_build }}
       cache_write: false
 
   build:
@@ -724,7 +785,7 @@ jobs:
           name: openclaw-gateway-msix-sideload-unsigned-bundle
           path: artifacts\sideload\bundle
 
-      - name: Download captured stable source
+      - name: Download captured source selection
         uses: actions/download-artifact@v8
         with:
           name: openclaw-source-resolution
@@ -1044,6 +1105,8 @@ jobs:
     needs:
       - changes
       - test-host
+      - cache-proof-write
+      - cache-proof-read
       - build
       - test-sign-msix
       - test-msix-upgrades
