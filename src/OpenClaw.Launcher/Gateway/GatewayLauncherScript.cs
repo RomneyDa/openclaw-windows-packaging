@@ -29,7 +29,7 @@ internal static class GatewayLauncherScript
         ArgumentException.ThrowIfNullOrWhiteSpace(activationScriptPath);
 
         string encodedCommand = Convert.ToBase64String(Encoding.Unicode.GetBytes(
-            $"& '{QuotePowerShell(activationScriptPath)}'"));
+            $"& '{QuotePowerShell(activationScriptPath)}'; exit $LASTEXITCODE"));
 
         // WScript has no console. Run hidden and wait so both persistence lanes
         // retain the recovery command's exit status rather than reporting spawn success.
