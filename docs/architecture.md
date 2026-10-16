@@ -207,7 +207,9 @@ waits for `clawctl gateway-service start --recovery`. Interactive CLI commands
 keep their normal terminal output. The background command retains normal host
 diagnostics and the task receives its exit code. Existing CMD registrations
 migrate only through an explicit `clawctl gateway-service install`; successful
-installation and teardown remove only marked legacy files. Windows Script Host
+installation and teardown remove only marked legacy files. If an existing task
+cannot be replaced, fallback setup retains its previous recovery files and
+reports that migration still requires action. Windows Script Host
 and its JScript engine must be available for this recovery lane.
 
 The real control command is `gateway-service`, not `gateway`. The configured

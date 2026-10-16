@@ -237,7 +237,21 @@ internal sealed class GatewayPersistenceManager
         _log(
             $"The logon task '{_identity.Name}' could not be registered; trying the " +
             $"Startup-folder fallback: {DiagnosticFailure.SingleLine(registration.Detail ?? "no detail was reported.")}");
-        return CompleteMigration(InstallFallback(registration.Detail));
+        GatewayPersistenceInstallResult fallback = InstallFallback(registration.Detail);
+        if (probe.Presence == GatewayTaskPresence.Present)
+        {
+            // The unchanged task may still reference the CMD launcher. A new
+            // fallback cannot retire files that the existing task still uses.
+            return fallback with
+            {
+                State = GatewayPersistenceState.ActionRequired,
+                Detail = Combine(fallback.Detail,
+                    "The existing logon task could not be replaced. Its previous recovery " +
+                    "files were retained until migration can be completed."),
+                Remediation = RepairCommand
+            };
+        }
+        return CompleteMigration(fallback);
     }
 
     public async Task<GatewayPersistenceRemovalResult> UninstallAsync(

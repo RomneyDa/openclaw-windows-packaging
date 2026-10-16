@@ -192,7 +192,11 @@ clawctl gateway-service install
 ```
 
 This explicitly replaces the old logon action and removes generated legacy
-Startup-folder files. Future recovery runs without a terminal. If recovery
+Startup-folder files. If Windows refuses to replace an existing task, setup
+retains that task's previous recovery files and reports that further action is
+required, even when it creates a new Startup-folder fallback. Resolve the
+reported permission failure and rerun the install command to finish migration.
+After a successful migration, future recovery runs without a terminal. If recovery
 fails, run `clawctl gateway-service start` interactively for the error and
 collect logs with `clawctl collect-logs`. For failures before `clawctl` starts,
 check the logon task's last-run result in Task Scheduler, the package's

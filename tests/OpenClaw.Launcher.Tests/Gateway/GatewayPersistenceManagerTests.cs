@@ -777,6 +777,37 @@ public sealed class GatewayPersistenceManagerTests : IDisposable
     }
 
     [Fact]
+    public async Task ARefusedLegacyTaskMigrationKeepsItsReferencedFiles()
+    {
+        GatewayPersistenceManager manager = CreateManager();
+        Directory.CreateDirectory(StateRoot);
+        Directory.CreateDirectory(StartupFolder);
+        string legacyLauncher = Path.ChangeExtension(LauncherPath, ".cmd");
+        string legacyFallback = Path.ChangeExtension(manager.FallbackPath, ".cmd");
+        await File.WriteAllTextAsync(legacyLauncher, GatewayLauncherScript.Marker);
+        await File.WriteAllTextAsync(legacyFallback, GatewayLauncherScript.Marker);
+        _scheduler.Probe = GatewayTaskProbe.Present(DesiredSnapshot() with
+        {
+            Command = @"C:\Windows\System32\cmd.exe",
+            Arguments = $"/d /c \"\"{legacyLauncher}\"\""
+        });
+        _scheduler.RegisterResult = GatewayTaskOperation.Failure("Access is denied.");
+
+        GatewayPersistenceInstallResult result = await manager.InstallAsync(CancellationToken.None);
+
+        Assert.Equal(GatewayPersistenceState.ActionRequired, result.State);
+        Assert.Equal(GatewayPersistenceLane.StartupFolderFallback, result.Lane);
+        Assert.Equal(GatewayPersistenceManager.RepairCommand, result.Remediation);
+        Assert.Contains("existing logon task", result.Detail, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(GatewayLauncherScript.Marker, await File.ReadAllTextAsync(legacyLauncher));
+        Assert.Equal(GatewayLauncherScript.Marker, await File.ReadAllTextAsync(legacyFallback));
+        Assert.True(File.Exists(LauncherPath));
+        Assert.True(File.Exists(manager.FallbackPath));
+        Assert.Equal(GatewayPersistenceState.ActionRequired,
+            (await manager.GetStatusAsync(CancellationToken.None)).State);
+    }
+
+    [Fact]
     public async Task ReinstallMigratesOnlyGeneratedCmdFiles()
     {
         GatewayPersistenceManager manager = CreateManager();
