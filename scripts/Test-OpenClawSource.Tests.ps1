@@ -141,8 +141,11 @@ try {
             elseif ($verificationState -eq 'absent') { $tag.PSObject.Properties.Remove('verification') }
             elseif ($verificationState -eq 'nonboolean') { $tag.verification.verified = 'true' }
             else { $tag.verification.reason = 'unknown_key' }
-            Assert-Throws { Resolve-OpenClawSource $policy } 'valid GitHub-verified signature'
-            Assert-Equal $http.Calls[-1].Key "GitHub:git/tags/$tagObject"
+            foreach ($mode in @('unsigned', 'test', 'store', 'official')) {
+                Assert-Throws { & $workflowPath @workflow -SigningMode $mode } 'valid GitHub-verified signature'
+                Assert-Equal (Test-Path -LiteralPath $workflow.OutputPath) $false
+                Assert-Equal $http.Calls[-1].Key "GitHub:git/tags/$tagObject"
+            }
         }
     }
     Invoke-Test 'a new resolution follows an advancing stable channel' {
