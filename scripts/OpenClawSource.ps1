@@ -213,6 +213,13 @@ function Resolve-OpenClawSource {
         if ($tag.sha -ine $tagObject -or $tag.tag -isnot [string] -or $tag.tag -cne $releaseTag) {
             throw 'The release tag object and name must match the selected release.'
         }
+        $verification = Get-OpenClawSourceField $tag 'verification' -Optional
+        if ($null -eq $verification -or
+            (Get-OpenClawSourceField $verification 'verified' -Optional) -isnot [bool] -or
+            -not (Get-OpenClawSourceField $verification 'verified' -Optional) -or
+            (Get-OpenClawSourceField $verification 'reason' -Optional) -cne 'valid') {
+            throw 'The release tag must have a valid GitHub-verified signature.'
+        }
         if ($tag.object.type -isnot [string] -or $tag.object.type -cne 'commit') {
             throw 'The annotated release tag must point directly to a commit.'
         }

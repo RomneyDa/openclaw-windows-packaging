@@ -134,18 +134,20 @@ try {
             Assert-Equal $call.Headers.ContainsKey('Authorization') ($call.Key.StartsWith('GitHub:'))
         }
     }
-    foreach ($verificationState in @('unsigned', 'absent')) {
-        Invoke-Test "stable source accepts $verificationState tag signing evidence" {
+    foreach ($verificationState in @('unsigned', 'absent', 'nonboolean', 'invalid-reason')) {
+        Invoke-Test "stable source rejects $verificationState tag signing evidence" {
             $tag = $http.Responses["GitHub:git/tags/$tagObject"]
             if ($verificationState -eq 'unsigned') {
                 $tag.verification = [pscustomobject]@{ verified = $false; reason = 'unsigned' }
             }
-            else { $tag.PSObject.Properties.Remove('verification') }
-            $source = Resolve-OpenClawSource $policy
-            Assert-Equal $source.resolvedCommit $commit
-            Assert-Equal $source.tagObject $tagObject
-            Assert-Equal $source.releaseTag "v$version"
-            Assert-Equal $source.registryIntegrity $integrity
+            elseif ($verificationState -eq 'absent') { $tag.PSObject.Properties.Remove('verification') }
+            elseif ($verificationState -eq 'nonboolean') { $tag.verification.verified = 'true' }
+            else { $tag.verification.reason = 'unknown_key' }
+            foreach ($mode in @('unsigned', 'test', 'store', 'official')) {
+                Assert-Throws { & $workflowPath @workflow -SigningMode $mode } 'valid GitHub-verified signature'
+                Assert-Equal (Test-Path -LiteralPath $workflow.OutputPath) $false
+                Assert-Equal $http.Calls[-1].Key "GitHub:git/tags/$tagObject"
+            }
         }
     }
     Invoke-Test 'a new resolution follows an advancing stable channel' {
