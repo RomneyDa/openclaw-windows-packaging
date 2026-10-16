@@ -52,13 +52,24 @@ function Assert-Relevance {
         [ValidateSet('true', 'false')]
         [string]$Expected,
 
-        [int]$MaximumFiles = 3000
+        [int]$MaximumFiles = 3000,
+
+        [switch]$PayloadArtifact,
+
+        [switch]$BundleBuild,
+
+        [switch]$Versioning
     )
 
     $path = Write-FileList -Files $Files
-    $actual = & $scriptPath `
-        -FileListPath $path `
-        -MaximumFiles $MaximumFiles
+    $parameters = @{
+        FileListPath = $path
+        MaximumFiles = $MaximumFiles
+        PayloadArtifact = $PayloadArtifact
+        BundleBuild = $BundleBuild
+        Versioning = $Versioning
+    }
+    $actual = & $scriptPath @parameters
     if ($actual -cne $Expected) {
         throw "Expected packaging relevance $Expected; received $actual."
     }
@@ -72,11 +83,21 @@ function Assert-PathRelevance {
 
         [Parameter(Mandatory)]
         [ValidateSet('true', 'false')]
-        [string]$Expected
+        [string]$Expected,
+
+        [switch]$PayloadArtifact,
+
+        [switch]$BundleBuild,
+
+        [switch]$Versioning
     )
 
     $path = Write-PathList -Content $Content
-    $actual = & $scriptPath -PathListPath $path
+    $actual = & $scriptPath `
+        -PathListPath $path `
+        -PayloadArtifact:$PayloadArtifact `
+        -BundleBuild:$BundleBuild `
+        -Versioning:$Versioning
     if ($actual -cne $Expected) {
         throw "Expected packaging relevance $Expected; received $actual."
     }
@@ -123,6 +144,82 @@ try {
             previous_filename = 'scripts/Build-MSIX.ps1'
         }
     )
+    Assert-Relevance -PayloadArtifact -Expected false -Files @(
+        @{ filename = 'src/OpenClaw.Launcher/Program.cs' }
+        @{ filename = 'scripts/Build-MSIX.ps1' }
+        @{ filename = 'docs/local-development.md' }
+    )
+    foreach ($payloadPath in @(
+        '.github/workflows/gateway-msix.yml'
+        'release-policy.json'
+        'scripts/Build-Payload.ps1'
+        'scripts/Copy-PayloadTree.ps1'
+        'scripts/Get-WorkflowSource.ps1'
+        'scripts/OpenClawSource.ps1'
+        'plugins/gateway-isolation/index.js'
+    )) {
+        Assert-Relevance -PayloadArtifact -Expected true -Files @(
+            @{ filename = $payloadPath }
+        )
+    }
+    Assert-Relevance -PayloadArtifact -Expected true -Files @(
+        @{
+            filename = 'docs/renamed.md'
+            previous_filename = 'plugins/gateway-isolation/openclaw.plugin.json'
+        }
+    )
+    Assert-Relevance -BundleBuild -Expected false -Files @(
+        @{ filename = 'src/OpenClaw.Launcher/Program.cs' }
+        @{ filename = 'plugins/gateway-isolation/index.js' }
+        @{ filename = 'scripts/Test-Build-MSIXBundle.Tests.ps1' }
+    )
+    foreach ($bundlePath in @(
+        '.github/workflows/gateway-msix.yml'
+        'scripts/Build-MSIX.ps1'
+        'scripts/Build-MSIXBundle.ps1'
+        'src/OpenClaw.Launcher/Package.appxmanifest'
+    )) {
+        Assert-Relevance -BundleBuild -Expected true -Files @(
+            @{ filename = $bundlePath }
+        )
+    }
+    Assert-Relevance -BundleBuild -Expected true -Files @(
+        @{
+            filename = 'docs/renamed.md'
+            previous_filename = 'scripts/Build-MSIXBundle.ps1'
+        }
+    )
+    Assert-Relevance -Versioning -Expected false -Files @(
+        @{ filename = 'src/OpenClaw.Launcher/Program.cs' }
+        @{ filename = 'plugins/gateway-isolation/index.js' }
+        @{ filename = 'docs/release-process.md' }
+    )
+    foreach ($versioningPath in @(
+        '.github/workflows/gateway-msix.yml'
+        'release-policy.json'
+        'scripts/Sign-TestMSIX.ps1'
+        'scripts/OpenClawSource.ps1'
+        'scripts/Get-WorkflowSource.ps1'
+        'scripts/Test-OpenClawSource.Tests.ps1'
+        'scripts/Get-MSIXReleaseIdentity.ps1'
+        'scripts/Get-MSIXUpgradeMatrix.ps1'
+        'scripts/Test-MSIXReleaseIdentity.Tests.ps1'
+        'scripts/Test-MSIXStoreUpgrade.ps1'
+        'scripts/Test-MSIXUpgrade.ps1'
+        'scripts/Test-MSIXUpgradeMatrix.Tests.ps1'
+        'scripts/Test-WorkflowSigningConfiguration.ps1'
+        'scripts/msix-upgrade-baselines.json'
+    )) {
+        Assert-Relevance -Versioning -Expected true -Files @(
+            @{ filename = $versioningPath }
+        )
+    }
+    Assert-Relevance -Versioning -Expected true -Files @(
+        @{
+            filename = 'docs/renamed.md'
+            previous_filename = 'release-policy.json'
+        }
+    )
 
     $cappedFiles = @(
         for ($index = 0; $index -lt 3; $index++) {
@@ -130,6 +227,21 @@ try {
         }
     )
     Assert-Relevance `
+        -Expected true `
+        -Files $cappedFiles `
+        -MaximumFiles 3
+    Assert-Relevance `
+        -PayloadArtifact `
+        -Expected true `
+        -Files $cappedFiles `
+        -MaximumFiles 3
+    Assert-Relevance `
+        -BundleBuild `
+        -Expected true `
+        -Files $cappedFiles `
+        -MaximumFiles 3
+    Assert-Relevance `
+        -Versioning `
         -Expected true `
         -Files $cappedFiles `
         -MaximumFiles 3
@@ -167,6 +279,38 @@ try {
         -Content "README.md$([char]0)$([char]0)docs/x.md$([char]0)"
     Assert-PathRelevance -Expected false -Content ''
     Assert-PathRelevance -Expected true -Content "src/readme.md.cs$([char]0)"
+    Assert-PathRelevance `
+        -PayloadArtifact `
+        -Expected false `
+        -Content "src/App.cs$([char]0)scripts/Build-MSIX.ps1$([char]0)"
+    Assert-PathRelevance `
+        -PayloadArtifact `
+        -Expected true `
+        -Content "src/App.cs$([char]0)plugins/gateway-isolation/index.js$([char]0)"
+    Assert-PathRelevance `
+        -BundleBuild `
+        -Expected false `
+        -Content "src/App.cs$([char]0)plugins/gateway-isolation/index.js$([char]0)"
+    Assert-PathRelevance `
+        -BundleBuild `
+        -Expected true `
+        -Content "src/App.cs$([char]0)scripts/Build-MSIX.ps1$([char]0)"
+    Assert-PathRelevance `
+        -Versioning `
+        -Expected false `
+        -Content "src/App.cs$([char]0)plugins/gateway-isolation/index.js$([char]0)"
+    Assert-PathRelevance `
+        -Versioning `
+        -Expected true `
+        -Content "src/App.cs$([char]0)release-policy.json$([char]0)"
+
+    Assert-Fails -MessagePattern 'mutually exclusive' -Action {
+        & $scriptPath `
+            -PathListPath (Write-PathList -Content 'src/App.cs') `
+            -PayloadArtifact `
+            -BundleBuild `
+            -Versioning
+    }
 
     Assert-Fails -MessagePattern 'does not exist' -Action {
         & $scriptPath -PathListPath (Join-Path $testRoot 'missing-paths.bin')

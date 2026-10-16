@@ -78,6 +78,35 @@ or package version logic:
 .\scripts\Test-GitHooks.Tests.ps1
 ```
 
+### CodeQL analysis
+
+[The CodeQL configuration](.github/codeql/codeql-config.yml) excludes the root
+`tests` tree from analysis. C# default setup uses `build-mode: none`, so tests
+otherwise enter the database even when they are not compiled into the product.
+The configuration leaves query selection and the configured threat model alone;
+it does not declare profile paths or executable discovery safe.
+
+Committing the file does not activate it. After merge, a maintainer must create
+the organization's `github-codeql-config-file` repository property if necessary
+and set this repository's value to `.github/codeql/codeql-config.yml`.
+[GitHub documents this default-setup customization](https://docs.github.com/en/code-security/concepts/code-scanning/repository-properties#custom-configuration-files).
+Confirm the next analysis's augmented configuration contains the exclusion.
+No repository or organization settings are changed by the local test.
+
+When changing this configuration, use a CodeQL bundle with C# queries and its
+executable on `PATH`, then run:
+
+```powershell
+.\scripts\Test-CodeQLConfiguration.Tests.ps1
+```
+
+Use `-CodeQlPath` to select a bundle outside `PATH`. The suite analyzes generated,
+dependency-free C# fixtures in temporary directories without executing them. It
+checks that test-only sinks and test-origin flows into production sinks disappear,
+while attacker-controlled paths, canonicalized paths, executables, working
+directories, and command arguments still report. Profile-folder controls must
+also keep reporting: their ownership modeling is a separate unresolved issue.
+
 ### Measure coverage
 
 Use coverage as a diagnostic to find gaps in meaningful behavior tests, not as
@@ -294,9 +323,10 @@ bypassable, and required CI checks remain authoritative.
 - Metadata files are part of the release trust chain. Coordinate changes across
   payload creation, MSIX creation, signing validation, workflow artifacts, and
   tests.
-- Keep official release identity derived from `gatewayTag` and `msixRevision`.
-  The unsuffixed Gateway tag owns revision block `1000-1999`; correction tags
-  `-2` through `-64` own their corresponding 1,000-number blocks. Use revision
+- Keep official release identity derived from the run's resolved Gateway tag
+  and the policy's `msixRevision`, using `scripts\Get-MSIXReleaseIdentity.ps1`.
+  The MSIX identity uses `year.month.VVPN.0`: Gateway release sequence `VV`,
+  correction digit `P`, and rebuild digit `N`. Use revision
   `0` for the first MSIX of a Gateway tag and increment only for packaging-only
   rebuilds of that exact tag. Do not assign package versions or release tags by
   hand.

@@ -26,21 +26,33 @@ $requiredFragments = @(
     "contains(needs.*.result, 'failure')"
     "contains(needs.*.result, 'cancelled')"
     'name: Upload payload'
-    'name: Test stable source selection'
+    'name: Test OpenClaw source selection'
     'name: Restore source selection for a retry'
     'name: Save immutable source selection'
     'name: openclaw-source-resolution'
     './scripts/Get-WorkflowSource.ps1'
-    "'scripts/OpenClawSource.ps1'"
-    "'scripts/Get-WorkflowSource.ps1'"
-    "'scripts/Test-OpenClawSource.Tests.ps1'"
+    'GATEWAY_VERSION: ${{ inputs.gateway_version }}'
+    '-GatewayVersion $env:GATEWAY_VERSION'
     '-ReuseSnapshot:($env:GITHUB_RUN_ATTEMPT -ne ''1'')'
     'ref: ${{ steps.resolve.outputs.sha }}'
     '-ExpectedVersion ''${{ steps.resolve.outputs.version }}'''
-    'GATEWAY_TAG: ${{ needs.build-package.outputs.source_tag }}'
+    'release_identity_tag: ${{ steps.resolve.outputs.release_identity_tag }}'
+    'GATEWAY_TAG: ${{ needs.build-package.outputs.release_identity_tag }}'
     '-GatewayTag $env:GATEWAY_TAG'
-    'OPENCLAW_REF: ${{ inputs.openclaw_ref || needs.build-package.outputs.source_sha }}'
-    "retention-days: `${{ github.event_name == 'pull_request' && 1 || 7 }}"
+    'name: Download captured source selection'
+    '-SourcePath source-resolution\source-resolution.json'
+    '-GatewayVersion $env:GATEWAY_VERSION'
+    '-WorkflowRunId $env:GITHUB_RUN_ID'
+    '-SigningMode $env:SIGNING_MODE'
+    'payload_artifact: ${{ steps.filter.outputs.payload_artifact }}'
+    'bundle_build: ${{ steps.filter.outputs.bundle_build }}'
+    "'payload_artifact=true' >> `$env:GITHUB_OUTPUT"
+    "'bundle_build=true' >> `$env:GITHUB_OUTPUT"
+    "`"payload_artifact=`$payloadArtifact`" >> `$env:GITHUB_OUTPUT"
+    "`"bundle_build=`$bundleBuild`" >> `$env:GITHUB_OUTPUT"
+    '-PayloadArtifact'
+    '-BundleBuild'
+    '-Versioning'
     'name: Restore cached OpenClaw package'
     "if: `${{ github.event_name != 'workflow_dispatch' || (inputs.signing_mode != 'official' && inputs.signing_mode != 'store') }}"
     'uses: actions/cache/restore@v4'
@@ -60,23 +72,37 @@ $requiredFragments = @(
     'subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}'
     'uses: azure/artifact-signing-action@v2'
     'name: Compose unsigned Store and sideload MSIX bundles'
+    'BUILD_STORE_PACKAGE: ${{ github.event_name != ''pull_request'' || needs.changes.outputs.bundle_build == ''true'' }}'
+    "IdentityChannel = 'Sideload'"
+    "if (`$env:BUILD_STORE_PACKAGE -eq 'true')"
+    "`$packageParameters.IdentityChannel = 'Store'"
+    "`$packageParameters.SideloadOutputDirectory = '`${{ runner.temp }}\openclaw-msix-sideload'"
     'name: Upload unsigned Store MSIX bundle'
     'name: Upload unsigned sideload MSIX bundle'
-    'name: Test MSIX identity transition and in-place upgrades'
+    'name: Test MSIX upgrade (${{ matrix.name }})'
     "needs.changes.outputs.versioning == 'true'"
-    'scripts/Test-MSIXReleaseIdentity.Tests.ps1'
+    'upgrade_matrix: ${{ steps.filter.outputs.upgrade_matrix }}'
+    '.\scripts\Get-MSIXUpgradeMatrix.ps1'
+    'matrix: ${{ fromJSON(needs.changes.outputs.upgrade_matrix) }}'
+    '.\scripts\Test-MSIXReleaseIdentity.Tests.ps1'
+    'name: Test MSIX upgrade matrix'
+    '.\scripts\Test-MSIXUpgradeMatrix.Tests.ps1'
     '.\scripts\msix-upgrade-baselines.json'
     '.\scripts\Test-MSIXUpgrade.ps1'
     '.\scripts\Test-MSIXStoreUpgrade.ps1'
-    'name: Download unsigned Store bundle candidate'
-    'name: Download unsigned sideload bundle candidate'
-    '-IdentityChannel sideload'
-    '-TransitionMode identity-reset'
-    '-TransitionMode in-place'
-    "-ExpectedBaselineVersion '2026.9.404.0'"
+    'fail-fast: false'
+    'name: Download unsigned candidate'
+    'name: Apply temporary test signature'
+    'CANDIDATE_CHANNEL: ${{ matrix.channel }}'
+    'BASELINE_ASSET: ${{ matrix.baseline_asset }}'
+    'BASELINE_RELEASE_TAG: ${{ matrix.release_tag }}'
+    'TRANSITION_MODE: ${{ matrix.transition_mode }}'
+    '-IdentityChannel $env:CANDIDATE_CHANNEL'
+    '-TransitionMode $env:TRANSITION_MODE'
+    '-BaselineAssetName $env:BASELINE_ASSET'
     "-StoreProductId '9NV70LV3D6XC'"
-    '-CandidateBundlePath test-signed\sideload\bundle\OpenClawGateway.msixbundle'
-    'openclaw-gateway-msix-upgrade-evidence'
+    '-CandidatePath $candidatePath'
+    'openclaw-gateway-msix-upgrade-evidence-${{ matrix.id }}'
     'retention-days: 90'
     '-IdentityChannel $channel'
     '-BundlePath "artifacts\$channelDirectory\bundle\OpenClawGateway.msixbundle"'
@@ -100,6 +126,7 @@ $requiredFragments = @(
     'tag_name: ${{ needs.authorize-signing.outputs.release_tag }}'
     'target_commitish: ${{ github.sha }}'
     'generate_release_notes: true'
+    'make_latest: true'
     'overwrite_files: false'
     'fail_on_unmatched_files: true'
     'release-assets/*.msixbundle'
@@ -108,6 +135,30 @@ $requiredFragments = @(
 foreach ($fragment in $requiredFragments) {
     if (-not $workflow.Contains($fragment, [StringComparison]::Ordinal)) {
         throw "Signing workflow is missing required configuration: $fragment"
+    }
+}
+
+if ($workflow.Contains(
+        '-ExpectedBaselineVersion',
+        [StringComparison]::Ordinal)) {
+    throw 'Store upgrade validation must use the version installed by Microsoft Store.'
+}
+
+foreach ($unsafeMatrixInterpolation in @(
+    "release download '`${{ matrix."
+    'throw "Unable to download ${{ matrix.'
+    "= 'test-signed\`${{ matrix."
+    "Join-Path `$candidateRoot '`${{ matrix."
+    "if ('`${{ matrix."
+    "-TransitionMode '`${{ matrix."
+    "-BaselineAssetName '`${{ matrix."
+    "-EvidencePath 'evidence\`${{ matrix."
+    '-IdentityChannel ${{ matrix.channel }}'
+)) {
+    if ($workflow.Contains(
+            $unsafeMatrixInterpolation,
+            [StringComparison]::Ordinal)) {
+        throw 'Upgrade matrix values must enter PowerShell through environment data.'
     }
 }
 
@@ -124,6 +175,79 @@ if ($buildMsixJob.Contains(
         [StringComparison]::Ordinal)) {
     throw 'The build-msix job must compose the locally built payload directly.'
 }
+$payloadUploadMatch = [regex]::Match(
+    $buildMsixJob,
+    "(?ms)^\s*- name: Upload payload\s+if: `\$\{\{ github\.event_name != 'pull_request' \|\| needs\.changes\.outputs\.payload_artifact == 'true' \}\}\s+uses: actions/upload-artifact@v7"
+)
+if (-not $payloadUploadMatch.Success) {
+    throw 'Only pull requests that change packaged application content may upload expanded payload artifacts.'
+}
+$buildMsixCalls = [regex]::Matches(
+    $buildMsixJob,
+    [regex]::Escape('.\scripts\Build-MSIX.ps1')
+)
+if ($buildMsixCalls.Count -ne 1) {
+    throw 'The build-msix job must compile once per architecture.'
+}
+$storePackageCondition = (
+    "if: `${{ github.event_name != 'pull_request' || " +
+    "needs.changes.outputs.bundle_build == 'true' }}"
+)
+$storeUploadMatch = [regex]::Match(
+    $buildMsixJob,
+    "(?ms)^\s*- name: Upload unsigned Store MSIX" +
+        "\s+$([regex]::Escape($storePackageCondition))" +
+        '\s+uses: actions/upload-artifact@v7'
+)
+if (-not $storeUploadMatch.Success) {
+    throw (
+        'Pull requests without a Store-package consumer must not build or ' +
+        'upload Store MSIX artifacts.'
+    )
+}
+$sideloadUploadMatch = [regex]::Match(
+    $buildMsixJob,
+    '(?ms)^\s*- name: Upload unsigned sideload MSIX' +
+        '\s+uses: actions/upload-artifact@v7'
+)
+if (-not $sideloadUploadMatch.Success) {
+    throw (
+        'Every packaging build must retain its deployable sideload MSIX ' +
+        'artifact.'
+    )
+}
+
+$bundleJobMatch = [regex]::Match(
+    $workflow,
+    "(?ms)^  build-msix-bundle:" +
+        ".*?^    if: `\$\{\{ github\.event_name != 'pull_request' \|\| " +
+        "needs\.changes\.outputs\.bundle_build == 'true' \}\}"
+)
+if (-not $bundleJobMatch.Success) {
+    throw 'Pull requests without bundle-facing changes must skip bundle composition.'
+}
+
+$bundleUploadCondition = (
+    "if: `${{ github.event_name != 'pull_request' || " +
+    "needs.changes.outputs.versioning == 'true' }}"
+)
+foreach ($uploadName in @(
+    'Upload unsigned Store MSIX bundle'
+    'Upload unsigned sideload MSIX bundle'
+)) {
+    $uploadMatch = [regex]::Match(
+        $workflow,
+        "(?ms)^\s*- name: $([regex]::Escape($uploadName))" +
+            "\s+$([regex]::Escape($bundleUploadCondition))" +
+            '\s+uses: actions/upload-artifact@v7'
+    )
+    if (-not $uploadMatch.Success) {
+        throw (
+            'Pull requests without versioning changes must not upload ' +
+            "the unused bundle artifact: $uploadName"
+        )
+    }
+}
 
 $dispatchDefaultMatch = [regex]::Match(
     $workflow,
@@ -133,9 +257,16 @@ if (-not $dispatchDefaultMatch.Success -or
     $workflow -match "(?m)^\s*OPENCLAW_REF:.*\|\|\s*'[0-9a-f]{40}'") {
     throw 'An empty source input must follow stable; do not add a second source pin.'
 }
+$versionDefaultMatch = [regex]::Match(
+    $workflow,
+    '(?ms)gateway_version:\s+description:.*?required:\s*false\s+default:\s*''''\s+type:\s*string'
+)
+if (-not $versionDefaultMatch.Success) {
+    throw 'The optional Gateway version override must default to empty.'
+}
 
 $identityCalls = [regex]::Matches($workflow, '-GatewayTag \$env:GATEWAY_TAG')
-if ($identityCalls.Count -ne 5) {
+if ($identityCalls.Count -ne 3) {
     throw 'MSIX, bundle and all upgrade verifications must use the same resolved Gateway tag.'
 }
 

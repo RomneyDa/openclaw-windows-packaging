@@ -136,7 +136,7 @@ it enabled.
 | `clawctl pwsh` | Open an interactive PowerShell session inside the agent session. |
 | `clawctl pwsh --command <text>` | Run one quoted PowerShell command string inside the agent session and return its exit code. |
 | `clawctl pwsh --file <path> [-- <arguments>]` | Run an agent-visible PowerShell script and return its exit code. Relative paths start in the shared folder reported by `clawctl status`; use `--` before script arguments that begin with `-`. |
-| `clawctl collect-logs [--output <path>]` | Create a redacted host-and-agent diagnostics ZIP. |
+| `clawctl collect-logs [--output <path>]` | Create a redacted host-and-agent diagnostics ZIP. See [Copilot diagnostics investigation](docs/troubleshooting.md#investigating-a-bundle-with-copilot-cli). |
 | `clawctl gateway-service start` | Start the OpenClaw gateway in the isolated session and wait for it to listen. Requires setup. |
 | `clawctl gateway-service status` | Inspect the gateway without starting it. When the gateway is not running, it may start/probe only the already-recorded isolated session to report file-only config readiness; it never provisions a replacement or starts the gateway. |
 | `clawctl gateway-service stop` | Stop the gateway while retaining the session and its data. |
@@ -209,7 +209,14 @@ document.
 
 The wait has a fixed budget. A gateway still coming up when the budget is spent
 is reported as starting rather than failed, and `clawctl gateway-service status`
-will show it once it binds.
+will show it once it binds. For `start` and `restart`, an accepted supervised
+launch whose process identity is verified but has no listener after 90 seconds
+returns exit code 0; JSON reports `ok: true` and `gateway.state: "starting"`.
+This acknowledges the owned launch, not readiness: it reports no port, URL, or
+listener ownership. Clients must continue bounded status polling and verify a
+running listener before using the Gateway or sending credentials. A failed
+inspection, exited process, or conflicting listener does not receive this
+acknowledgement.
 
 `clawctl` reports the gateway port only when it can identify that listener
 unambiguously:
@@ -267,9 +274,8 @@ Those four values are compiled into the binary as constants by the build that
 produces the package, so the report cannot drift from the payload it shipped
 with and costs no file or process access at startup. `Build-MSIX.ps1` supplies
 the versions and commits it also records in `msix-metadata.json`; an ordinary
-build falls back to the pin recorded in `release-policy.json`, and reports
-`unknown` for a value no build supplied. The report never comes from the entry
-assembly, so it stays correct when the launcher is hosted by another process.
+build reports `unknown` for a value no build supplied. The report never comes
+from the entry assembly, so it stays correct when the launcher is hosted by another process.
 
 Response-file expansion is disabled. A leading `@` has no meaning to `clawctl`
 and is reported as an unrecognized argument rather than read from disk.
@@ -346,10 +352,12 @@ update does not remove a running process's runtime.
 ## Selecting the OpenClaw revision
 
 `.github\workflows\gateway-msix.yml` selects **stable** whenever a new packaging
-run starts: public npm `openclaw@latest`, or the exact `stableVersion` when
-`release-policy.json` pins one (see below). The resolver checks the exact
-published version, its signed upstream tag and commit, and the source
-package version before building. There is no automatic fallback to another
+run starts: the exact `stableVersion` when `release-policy.json` pins one,
+otherwise public npm `openclaw@latest`. The resolver checks the exact
+published version, its annotated upstream tag and target commit, and the source
+package version before building. Git tag and commit signatures are not required;
+official publication uses the same stable selection and validates its recorded
+commit and version before signing. There is no automatic fallback to another
 version or channel; extended-stable and named prereleases are rejected.
 Source selection also checks the MSIX release-version rules before building:
 numeric correction suffixes must be `-2` through `-9`. Unsupported corrections
@@ -360,17 +368,34 @@ Retries reuse it without querying the moving channel again. If the snapshot
 is missing or expired (90-day retention), start a new run instead of retrying.
 Package and payload metadata record the resolved source commit and version.
 
-For a one-time unsigned/test override, provide a stable-source tag, branch, or
-full commit SHA in the manual `openclaw_ref` input. Empty means follow stable.
+For a one-time source override in any signing mode, provide an OpenClaw tag,
+branch, or full commit SHA in the manual `openclaw_ref` input. Empty means follow
+stable. The resolver records the ref's exact commit and package version once;
+retries use that immutable snapshot even if a branch later moves. Release modes
+also capture the unmodified stable selector as the MSIX and GitHub release
+identity source, so a hotfix payload does not create a second version owner.
+The override payload version may equal or precede that stable identity, but may
+not be newer.
+For a one-run rollback of the bundled payload in any signing mode, set
+`gateway_version` to an older exact stable release. The payload uses that version,
+while the MSIX and GitHub release identity continue from the unmodified stable
+selector above so the package remains an upgrade. Both sources are verified and
+captured in the immutable snapshot. The workflow rejects an override that is not
+older than the release-identity source. Unsigned and test runs reject combining
+it with `openclaw_ref`; Store and official runs preserve a full-SHA
+`openclaw_ref` as an assertion that the version resolved to the intended commit.
 If compatibility requires an older known-good stable release, a reviewed
 `stableVersion` field in `release-policy.json` can pin its exact version, for
-example `"stableVersion": "2026.9.4"`. A pin is not automatic fallback and does
-not grant official-signing approval.
+example `"stableVersion": "2026.9.4"`. That pin applies to all modes until removed;
+it is not automatic fallback.
 
-For official signing, the selected source must match `approvedCommit`,
-`gatewayTag`, and `payloadPackageVersion` in `release-policy.json`. An empty
-input selects stable and checks that approval; an explicit input must be the
-full approved commit SHA.
+For `store` and `official`, `openclaw_ref` selects the payload source while the
+reviewed stable policy still owns release identity. Before authorization, the
+workflow restores the same run's payload and release-identity snapshot and
+checks its requested ref, workflow run ID, packaging commit, and signing mode.
+When `gateway_version` selects the payload instead, `openclaw_ref` may only be a
+full SHA and must match that release. The workflow does not resolve the moving
+branch or stable channel again.
 
 Payload composition validates that the selected OpenClaw runtime discovers and
 activates the packaging-owned Windows Launcher plugin by default, both without
@@ -403,11 +428,10 @@ The payload artifact records the requested ref and resolved upstream commit in
 OpenClaw commit, while embedded `payload-files.json` records every packaged
 application file's path, length, and SHA-256.
 
-`release-policy.json` records the immutable OpenClaw commit and Gateway tag
-approved for official signing, plus an independent MSIX packaging revision.
-Updating that
-policy requires a reviewed repository change. Official signing runs only from
-`main` and verifies the workflow input, policy-approved package version, both
+`release-policy.json` records the stable channel, MSIX packaging revision, and
+package identities. Updating that policy requires a reviewed repository change.
+Official signing runs only from `main` and verifies the recorded source snapshot,
+derived package version, both
 architecture metadata files, both MSIX hashes, the embedded manifests, and
 every file against the embedded application inventory. It also byte-compares
 the bundle's embedded packages with those authorized standalone packages before
@@ -486,23 +510,38 @@ does not rewrite them. Direct-Node UI fixtures verify rendering and interactions
 not packaged-launcher isolation or installed upgrade behavior.
 
 The same plugin supplies agent instructions on Windows when the launcher report
-is exactly `enabled`. Before supported agent runs, it prepends context explaining
-that local GUI is not the user's desktop, user participation needs a supported
-text/headless route, and private work should stay private while only intended
-deliverables are handed off. Authorized agent-only GUI work that needs no human
-viewing or input is allowed; this is not a blanket GUI prohibition.
-Remote or user-session nodes require their own
-capability and authorization checks. This is guidance, not isolation enforcement
-or a file-export feature; it does not install a skill or overwrite workspace
-instructions or configuration.
+is exactly `enabled`. Its `before_prompt_build` hook supplies two sentences
+explaining that local windows are invisible to the user, local file access does
+not imply user access, and essential credential, MFA/consent, ACL/isolation,
+human-GUI, and private-workspace prohibitions apply before any skill is loaded.
+Procedural detail stays in the skill. Static guidance is appended through
+`appendSystemContext`, without duplicating it in the user prompt.
+This is guidance, not isolation enforcement or a file-export feature; it does
+not overwrite workspace instructions or configuration.
+It is not a blanket prohibition on agent-only GUI work.
+
+The plugin also bundles the
+[`windows-agent-handoff` skill](plugins/gateway-isolation/skills/windows-agent-handoff/SKILL.md).
+The short context names it for user-facing GUI, sign-in, and file delivery.
+OpenClaw advertises eligible skills and loads their instructions on demand;
+the detailed procedures are not inserted into every prompt. One successful
+`SKILL.md` read supplies the complete GUI/authentication, client delivery, and
+filesystem handoff procedures, without branch-file lookups. It checks the exact
+isolation report before acting and requires observable completion evidence.
+For an unknown sign-in service, it asks which service and waits; for a known
+service without official instructions, it obtains or requests those instructions
+before proposing a flow. Its Windows and
+environment metadata are discovery filters, not authorization. Disabling the
+plugin removes its skill; `skills.entries.windows-agent-handoff.enabled=false`
+disables the skill independently. Hook opt-outs do not disable manifest skills.
 
 The plugin supplies static guidance, not a shared-path environment variable.
 For filesystem handoff, prefer a host-reported or user-selected destination.
 The host reports `session.sharedFolder` through `clawctl status --json` in the
 user's normal terminal; that command can start the recorded session.
-When neither destination is supplied, the guidance assumes the isolated agent
-account has an existing `Shared` folder. Resolve it with a local tool inside
-that agent session, for example:
+The skill names the isolated agent's existing `Shared` folder as a handoff
+option. When neither destination is supplied, resolve it with a local tool
+inside that agent session, for example:
 
 ```powershell
 (Resolve-Path -LiteralPath (Join-Path $env:USERPROFILE 'Shared') -ErrorAction Stop).Path
@@ -532,12 +571,8 @@ merged by
 [`openclaw/openclaw#145409`](https://github.com/openclaw/openclaw/pull/145409).
 OpenClaw `v2026.9.5` at `ec9c1a13db8938e5a3eaa51fca2e981cde2395a9`
 includes that forwarding and has been qualified with this default-on plugin.
-Unsigned and test builds follow the stable-source selection above; that
-qualification is not an official runtime approval.
-The official-signing policy remains on the release-approved OpenClaw `v2026.9.4`
-baseline (`3a9d69db306cd7f081e06254cb89c4bcc14a7107`); that approval does not
-establish support for this default-on/theme contract. A compatible runtime
-requires separate reviewed approval before an official release. Without theme
+All build modes follow the stable-source selection above and validate plugin
+compatibility during payload composition. Without theme
 forwarding, the page uses the browser or operating system light/dark preference
 with a safe built-in palette.
 
@@ -632,17 +667,21 @@ never official-signing inputs.
 Normal pull-request and push workflows publish unsigned packages for
 validation. Manual runs support four modes:
 
-- `unsigned` follows stable or a stable-source override and publishes unsigned
+- `unsigned` follows stable or an `openclaw_ref` override and publishes unsigned
   MSIX packages;
 - `test` uses the same source-selection rules and publishes MSIX packages signed with a
   temporary self-signed certificate plus the public `.cer` needed for local
   installation;
-- `store` requires the reviewed immutable commit from `release-policy.json`,
-  may run only from `main`, and publishes permanent unsigned Partner Center
-  submission assets; Microsoft signs them during Store ingestion;
-- `official` requires the approved immutable commit from
-  `release-policy.json`, may run only from `main`, and publishes the signed
-  packages as permanent assets on a GitHub Release named by the policy.
+- `store` follows stable, an `openclaw_ref` override, or an older payload pinned
+  with `gateway_version`,
+  may run only from `main`, and retains an unsigned Partner Center submission bundle for 90 days;
+  Microsoft signs it during Store ingestion;
+- `official` uses the same source rules, may run only from `main`, and publishes
+  signed packages as permanent GitHub Release assets when `publish_release`
+  is enabled.
+
+Following stable does not automatically sign or publish a new Gateway release;
+publication still requires a manual workflow dispatch.
 
 Official signing uses the protected `release-signing` environment, Azure OIDC,
 and the existing OpenClaw Artifact Signing account and certificate profile.
@@ -651,7 +690,10 @@ and are deleted before artifacts are uploaded. No signing secret or private
 key is stored in the repository.
 
 Official releases derive their GitHub tag and four-part numeric MSIX identity
-from `gatewayTag` and `msixRevision` in `release-policy.json`. The GitHub tag is
+from the recorded release-identity source and `msixRevision` in
+`release-policy.json`. Normally that source is also the packaged payload. A
+`openclaw_ref` and `gateway_version` overrides keep the unmodified stable source
+as the release identity and record the selected payload separately. The GitHub tag is
 `<gateway-tag>-msix.<revision>`. The MSIX identity is
 `year.month.VVPN.0`: `VV` is the two-digit monthly Gateway release sequence,
 `P` is the Gateway correction digit, and `N` is the MSIX rebuild digit. The
@@ -675,17 +717,18 @@ Decimal place value guarantees Gateway release > Gateway correction > MSIX
 rebuild while keeping every component at four digits or fewer and reserving the
 fourth component as `0` for Microsoft Store submission.
 
-To prepare an official release, update these policy inputs together in a
-reviewed pull request:
+For a new Gateway release, keep `msixRevision` at `0`; if a previous packaging
+rebuild increased it, reset it in a reviewed pull request first. Increment it
+only to rebuild the same Gateway tag. No policy version or commit update is
+needed when stable advances.
 
-1. `gatewayTag` to the stable upstream Gateway tag;
-2. `approvedCommit` to the immutable commit resolved from that tag;
-3. `payloadPackageVersion` to the version reported by the pinned payload;
-4. `msixRevision` to `0`, or increment it for a packaging-only rebuild of the
-   same Gateway tag.
-
-After that pull request merges, manually run **Build OpenClaw Gateway MSIX** on
-`main` with `openclaw_ref` set to the approved commit. Use `signing_mode=store`
+Manually run **Build OpenClaw Gateway MSIX** on `main`. Leave `openclaw_ref`
+empty to follow policy/latest, or set it to the OpenClaw branch, tag, or full
+SHA to package. Prefer the reviewed full SHA for a hot release; a branch is
+resolved once and its commit is captured in the run snapshot. Leave
+`gateway_version` empty unless selecting an exact stable version older than
+policy/latest for a one-off payload rollback.
+Use `signing_mode=store`
 to retain only the unsigned Partner Center bundle, or `signing_mode=official`
 to additionally sign and publish the sideload identity. The workflow derives
 the package version and release tag. Official mode creates the tag and
@@ -713,21 +756,24 @@ verify the legacy identity, remove it, install the Store candidate through the
 same delivery format, and prove that Windows registered the reserved package
 family with isolated LocalState. The same gate updates each baseline in place
 to the new sideload candidate and proves that standalone and bundle delivery
-retain the exact LocalState marker. When the previous Store revision reached
-users, the gate also installs that exact published Store version by Store ID
-and proves that both Store candidate formats update it in place while retaining
-the marker. Changes to source-selection scripts also trigger this check against
-the selected release. The gate additionally proves fresh installation of both
-Store candidate formats. It refuses to run when a Gateway package is
-already registered and removes only packages installed by that test
-invocation. It temporarily trusts the ephemeral test-signing certificate in
-the local-machine Trusted People store, as required by Windows deployment, and
-removes that certificate in `finally`. The resulting JSON evidence is retained
-as a workflow artifact for 90 days. This identity change is the explicitly
-approved breaking reset. Until Partner Center distributes a Store-signed
-package, later policy revisions repeat the reset and fresh-install proof. After
-the reserved identity reaches users, subsequent releases install the authentic
-Store baseline and prove in-place upgrade with LocalState retention.
+retain the exact LocalState marker. The gate also installs the package Microsoft
+Store currently delivers by Store ID, records its validated version, requires
+the candidate to be newer, and proves that the Store bundle updates it in place
+while retaining the marker. Changes to source-selection scripts also trigger
+this check against the selected release. Each baseline, delivery format, and
+transition mode runs on its own clean Windows runner. The identity-reset
+scenarios also prove that both Store candidate formats install fresh after the
+legacy package is removed.
+Each scenario refuses to run when a Gateway package is already registered and
+removes only packages installed by that test invocation. It temporarily trusts
+the ephemeral test-signing certificate in the local-machine Trusted People
+store, as required by Windows deployment, and removes that certificate in
+`finally`. The per-scenario JSON evidence artifacts are retained for 90 days.
+This identity change is the explicitly approved breaking reset. Until Partner
+Center distributes a Store-signed package, later policy revisions repeat the
+reset and fresh-install proof. After the reserved identity reaches users,
+subsequent releases install the authentic Store baseline and prove in-place
+upgrade with LocalState retention.
 
 An `.msixbundle` is a single installable container for the x64 and ARM64 MSIX
 packages; Windows selects the package appropriate for the device. An

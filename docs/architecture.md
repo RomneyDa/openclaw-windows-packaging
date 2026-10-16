@@ -189,7 +189,12 @@ persists launch choices because the later logon task has no interactive caller
 from which to recover them. [`SchTasksGatewayScheduler`](../src/OpenClaw.Launcher/Gateway/SchTasksGatewayScheduler.cs)
 uses the inbox `schtasks.exe` and a task registered for the signed-in user's
 logon, avoiding NativeAOT-incompatible Task Scheduler COM interop and avoiding
-elevation that would make the task user-unmanageable.
+elevation that would make the task user-unmanageable. After registration, the
+persistence manager reads the task back before reporting recovery ready or
+removing a Startup-folder fallback. Trigger or principal drift reports the
+expected and observed identities; an unreadable result remains unknown. The
+owning token SID and the interactive logon SID remain separate for account
+compatibility, rather than silently redirecting recovery to another user.
 
 The real control command is `gateway-service`, not `gateway`. The configured
 port is distinct from the upstream default. The launcher does not force the
@@ -204,12 +209,33 @@ under one lifecycle lock. A missing or already-exited gateway makes the stop a
 no-op and the start continues. If the gateway cannot be confirmed stopped, the
 operation retains its ownership record and does not launch a replacement.
 
+Start and restart wait up to 90 seconds for an owned listener. A verified live
+supervisor with no listener can then return successful acceptance with
+`gateway.state: "starting"`; this is not a running or credential-handoff claim.
+The record remains available for inspection and stop, and clients keep their
+own bounded readiness wait. Inspection failures, terminal supervisor failures,
+and listener conflicts remain unsuccessful starts.
+
+Process access denial is not evidence that a recorded PID belongs to another
+process. Inspection uses query rights instead of requesting a full-access
+handle. If Windows denies inspection or termination, the session helper reads
+the OS process creation-time snapshot without opening the target. Only an
+observed missing PID or creation-time mismatch permits stale-record recovery.
+A matching identity or unavailable snapshot remains unknown: its record stays
+intact and no replacement is launched. Stop still pins and verifies its handle
+before termination, and never kills a PID selected only by a snapshot.
+
 ## Companion uses the package's isolated session
 
 The Windows Companion app selects the current-user Gateway MSIX by its exact
 package registration and qualified `clawctl.exe` alias. It probes
 `clawctl status --json` for the versioned `isolated-session` integration
-contract. After setup, `clawctl companion prepare --port <port> --json`
+contract. Operational exception responses retain this capability metadata with
+`ok: false`, the selected command, and the original error. Capability does not
+assert session readiness or authorize credential handoff: Companion can reach
+its existing explicit package setup step, whose successful ready-session
+response is still required. Status itself never provisions or repairs a session.
+After setup, `clawctl companion prepare --port <port> --json`
 instructs [`SessionCompanionConfig`](../src/OpenClaw.SessionHost/SessionCompanionConfig.cs)
 to read the agent's effective Gateway configuration through upstream-owned
 runtime code. The packaged `plugin-sdk/health` snapshot reader runs with

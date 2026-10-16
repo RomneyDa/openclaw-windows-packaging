@@ -13,10 +13,9 @@ if ($parseErrors.Count -ne 0 -or $ast.BeginBlock -or $ast.ProcessBlock -or
             $_ -isnot [Management.Automation.Language.FunctionDefinitionAst]
         }).Count -ne 0) { throw 'The source helper must contain only valid function definitions.' }
 if (@(. $sourcePath).Count -ne 0) { throw 'Dot-sourcing the helper must not produce output.' }
-$basePolicy = Read-OpenClawReleasePolicy $policyPath
-$commit = $basePolicy.approvedCommit
-$version = $basePolicy.payloadPackageVersion
-$tagObject = '8bec206f3c1f787e1e9c45cfd34d3de2a78c7b8e'
+$commit = 'c' * 40
+$version = '2026.9.4'
+$tagObject = 'd' * 40
 $integrity = 'sha512-' + [Convert]::ToBase64String([byte[]]::new(64))
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) "openclaw-source-tests-$([guid]::NewGuid().ToString('N'))"
 $testCount = 0
@@ -133,6 +132,20 @@ try {
             Assert-Equal $call.Headers.ContainsKey('Authorization') ($call.Key.StartsWith('GitHub:'))
         }
     }
+    foreach ($verificationState in @('unsigned', 'absent')) {
+        Invoke-Test "stable source accepts $verificationState tag signing evidence" {
+            $tag = $http.Responses["GitHub:git/tags/$tagObject"]
+            if ($verificationState -eq 'unsigned') {
+                $tag.verification = [pscustomobject]@{ verified = $false; reason = 'unsigned' }
+            }
+            else { $tag.PSObject.Properties.Remove('verification') }
+            $source = Resolve-OpenClawSource $policy
+            Assert-Equal $source.resolvedCommit $commit
+            Assert-Equal $source.tagObject $tagObject
+            Assert-Equal $source.releaseTag "v$version"
+            Assert-Equal $source.registryIntegrity $integrity
+        }
+    }
     Invoke-Test 'a new resolution follows an advancing stable channel' {
         $first = Resolve-OpenClawSource $policy
         Add-Release '2026.9.5' ('a' * 40) ('b' * 40)
@@ -162,10 +175,8 @@ try {
             @{ Name = 'registry gitHead'; Edit = { $http.Responses["Registry:$version"].gitHead = 'a' * 40 }; Error = 'gitHead' },
             @{ Name = 'lightweight tag'; Edit = { $http.Responses["GitHub:git/ref/tags/v$version"].object.type = 'commit' }; Error = 'annotated tag' },
             @{ Name = 'wrong tag ref'; Edit = { $http.Responses["GitHub:git/ref/tags/v$version"].ref = 'refs/tags/other' }; Error = 'annotated tag' },
-            @{ Name = 'unsigned tag'; Edit = { $http.Responses["GitHub:git/tags/$tagObject"].verification.verified = $false }; Error = 'signature' },
-            @{ Name = 'nonboolean verification'; Edit = { $http.Responses["GitHub:git/tags/$tagObject"].verification.verified = 'true' }; Error = 'signature' },
-            @{ Name = 'wrong tag SHA'; Edit = { $http.Responses["GitHub:git/tags/$tagObject"].sha = 'a' * 40 }; Error = 'signature' },
-            @{ Name = 'wrong tag label'; Edit = { $http.Responses["GitHub:git/tags/$tagObject"].tag = 'v2026.9.5' }; Error = 'signature' },
+            @{ Name = 'wrong tag SHA'; Edit = { $http.Responses["GitHub:git/tags/$tagObject"].sha = 'a' * 40 }; Error = 'tag object and name' },
+            @{ Name = 'wrong tag label'; Edit = { $http.Responses["GitHub:git/tags/$tagObject"].tag = 'v2026.9.5' }; Error = 'tag object and name' },
             @{ Name = 'nested tag target'; Edit = { $http.Responses["GitHub:git/tags/$tagObject"].object.type = 'tag' }; Error = 'directly to a commit' },
             @{ Name = 'source name'; Edit = { Set-Package -Name 'other' }; Error = 'source package name' },
             @{ Name = 'source correction mismatch'; Edit = {
@@ -249,6 +260,45 @@ try {
         Assert-Equal $http.Calls[0].Key "Registry:$version"
         Assert-Equal @(@($http.Calls.Key) -match 'Registry:latest').Count 0
     }
+    Invoke-Test 'a workflow payload override preserves the advancing release identity' {
+        Add-Release '2026.9.5' ('a' * 40) ('b' * 40)
+        Add-Release '2026.9.7' ('e' * 40) ('f' * 40)
+        $http.Responses['Registry:latest'].version = '2026.9.8'
+        $policy | Add-Member stableVersion '2026.9.7'
+        Save-Policy
+        $source = & $workflowPath @workflow -SigningMode official -GatewayVersion '2026.9.5' -Ref ('a' * 40)
+        Assert-Equal $source.requestedRef '2026.9.5'
+        Assert-Equal $source.packageVersion '2026.9.5'
+        Assert-Equal $source.resolvedCommit ('a' * 40)
+        Assert-Equal $source.channel 'stable'
+        Assert-Equal $http.Calls[0].Key 'Registry:2026.9.5'
+        Assert-Equal $source.releaseIdentitySource.requestedRef '2026.9.7'
+        Assert-Equal $source.releaseIdentitySource.packageVersion '2026.9.7'
+        Assert-Equal $source.releaseIdentitySource.resolvedCommit ('e' * 40)
+        Assert-Equal $source.releaseIdentitySource.releaseTag 'v2026.9.7'
+        Assert-Equal @(@($http.Calls.Key) -match 'Registry:latest').Count 0
+        $http.Calls.Clear()
+        $replayed = & $workflowPath @workflow -SigningMode official -GatewayVersion '2026.9.5' -Ref ('a' * 40) -ReuseSnapshot
+        Assert-Equal $replayed.resolvedCommit $source.resolvedCommit
+        Assert-Throws {
+            & $workflowPath @workflow -SigningMode official -GatewayVersion $version -Ref ('a' * 40) -ReuseSnapshot
+        } 'requestedRef'
+        Assert-Throws {
+            & $workflowPath @workflow -SigningMode official -GatewayVersion '2026.9.5' -Ref ('b' * 40) -ReuseSnapshot
+        } 'does not match the captured GatewayVersion release'
+        Assert-Equal $http.Calls.Count 0
+    }
+    Invoke-Test 'a workflow payload override must remain below its release identity' {
+        Assert-Throws {
+            & $workflowPath @workflow -SigningMode official -GatewayVersion $version
+        } 'older than the current stable release identity'
+        Assert-Equal (Test-Path -LiteralPath $workflow.OutputPath) $false
+    }
+    Invoke-Test 'workflow version overrides reject invalid or ambiguous selectors before HTTP' {
+        Assert-Throws { & $workflowPath @workflow -GatewayVersion 'latest' } 'GatewayVersion|packageVersion'
+        Assert-Throws { & $workflowPath @workflow -GatewayVersion $version -Ref $commit } 'cannot both select'
+        Assert-Equal $http.Calls.Count 0
+    }
     Invoke-Test 'a withdrawn or mismatched exact pin never falls back' {
         $policy | Add-Member stableVersion '2026.8.31'
         Assert-Throws { Resolve-OpenClawSource $policy } 'Missing offline response'
@@ -275,7 +325,7 @@ try {
         foreach ($ref in @('extended-stable', 'refs/heads/extended-stable', 'refs/tags/extended-stable/test')) {
             Assert-Throws { Resolve-OpenClawSource $policy -Ref $ref } 'extended-stable'
         }
-        $policy | Add-Member channel 'extended-stable'
+        $policy.channel = 'extended-stable'
         Assert-Throws { Resolve-OpenClawSource $policy } 'channel'
         $policy.channel = 'stable'
         $policy | Add-Member stableVersion '2026.6.35'
@@ -295,10 +345,15 @@ try {
         Assert-Equal $replayed.resolvedCommit $source.resolvedCommit
         Assert-Equal ([Convert]::ToBase64String([IO.File]::ReadAllBytes($workflow.OutputPath))) ([Convert]::ToBase64String($bytes))
         Assert-Throws { & $workflowPath @workflow } 'already exists'
-        foreach ($field in @('WorkflowRunId', 'PackagingCommit', 'SigningMode', 'Ref')) {
+        foreach ($field in @('WorkflowRunId', 'PackagingCommit', 'SigningMode', 'Ref', 'GatewayVersion')) {
             $changed = $workflow.Clone()
-            $changed[$field] = @{ WorkflowRunId = '999'; PackagingCommit = 'e' * 40; SigningMode = 'test'; Ref = "v$version" }[$field]
-            Assert-Throws { & $workflowPath @changed -ReuseSnapshot } 'workflow identity|requested selector'
+            $changed[$field] = @{
+                WorkflowRunId = '999'; PackagingCommit = 'e' * 40; SigningMode = 'test'
+                Ref = "v$version"; GatewayVersion = '2026.9.3'
+            }[$field]
+            Assert-Throws {
+                & $workflowPath @changed -ReuseSnapshot
+            } 'workflow identity|requested selector|source channel|release identity source'
         }
         Assert-Equal $http.Calls.Count 0
     }
@@ -335,35 +390,74 @@ try {
         Assert-Equal $http.Calls.Count 0
     }
     foreach ($mode in @('official', 'store')) {
-        foreach ($ref in @('', $commit)) {
-            Invoke-Test "$mode release accepts the reviewed release via selector '$ref'" {
-                $source = & $workflowPath @workflow -SigningMode $mode -Ref $ref
-                Assert-Equal $source.resolvedCommit $commit
-            }
+        Invoke-Test "$mode release follows stable and replays the captured release after latest advances" {
+            Add-Release '2026.9.7' ('a' * 40) ('b' * 40)
+            $http.Responses['Registry:latest'].version = '2026.9.7'
+            $source = & $workflowPath @workflow -SigningMode $mode
+            Assert-Equal $source.resolvedCommit ('a' * 40)
+            Assert-Equal $source.releaseTag 'v2026.9.7'
+            Assert-Equal $source.packageVersion '2026.9.7'
+            Add-Release '2026.9.8' ('e' * 40) ('f' * 40)
+            $http.Responses['Registry:latest'].version = '2026.9.8'
+            $http.Calls.Clear()
+            $replayed = & $workflowPath @workflow -SigningMode $mode -ReuseSnapshot
+            Assert-Equal $replayed.resolvedCommit $source.resolvedCommit
+            Assert-Equal $replayed.releaseTag $source.releaseTag
+            Assert-Equal $http.Calls.Count 0
         }
-    }
-    foreach ($mode in @('official', 'store')) {
-        Invoke-Test "a valid newer stable channel is not $mode release authority" {
-            Add-Release '2026.9.5' ('a' * 40) ('b' * 40)
-            $http.Responses['Registry:latest'].version = '2026.9.5'
-            Assert-Throws { & $workflowPath @workflow -SigningMode $mode } 'reviewed approvedCommit'
+        Invoke-Test "$mode release builds a full SHA override and captures stable release identity" {
+            $source = & $workflowPath @workflow -SigningMode $mode -Ref $commit
+            Assert-Equal $source.resolvedCommit $commit
+            Assert-Equal $source.channel ''
+            Assert-Equal $source.requestedRef $commit
+            Assert-Equal $source.releaseIdentitySource.channel 'stable'
+            Assert-Equal $source.releaseIdentitySource.requestedRef 'stable'
+            Assert-Equal $source.releaseIdentitySource.resolvedCommit $commit
+            $http.Calls.Clear()
+            $replayed = & $workflowPath @workflow -SigningMode $mode -Ref $commit -ReuseSnapshot
+            Assert-Equal $replayed.resolvedCommit $commit
+            Assert-Throws { & $workflowPath @workflow -SigningMode $mode -Ref ('a' * 40) -ReuseSnapshot } 'requested selector'
+            Assert-Equal $http.Calls.Count 0
+        }
+        Invoke-Test "$mode release builds a branch override at a different commit" {
+            $hotfixCommit = 'a' * 40
+            $http.Responses['GitHub:commits/hotfix%2Fgateway'] = [pscustomobject]@{ sha = $hotfixCommit }
+            Set-Package -Commit $hotfixCommit
+            $source = & $workflowPath @workflow -SigningMode $mode -Ref 'hotfix/gateway'
+            Assert-Equal $source.requestedRef 'hotfix/gateway'
+            Assert-Equal $source.resolvedCommit $hotfixCommit
+            Assert-Equal $source.packageVersion $version
+            Assert-Equal $source.releaseIdentitySource.resolvedCommit $commit
+            Assert-Equal $source.releaseIdentitySource.releaseTag "v$version"
+        }
+        Invoke-Test "$mode release rejects a ref whose payload version is newer than stable identity" {
+            $hotfixCommit = 'a' * 40
+            $http.Responses['GitHub:commits/next'] = [pscustomobject]@{ sha = $hotfixCommit }
+            Set-Package -Version '2026.9.5' -Commit $hotfixCommit
+            Assert-Throws {
+                & $workflowPath @workflow -SigningMode $mode -Ref 'next'
+            } 'not newer than the current stable release identity'
             Assert-Equal (Test-Path -LiteralPath $workflow.OutputPath) $false
         }
-    }
-    foreach ($field in @('approvedCommit', 'payloadPackageVersion', 'gatewayTag')) {
-        foreach ($mode in @('official', 'store')) {
-            Invoke-Test "$mode release still requires the reviewed $field" {
-                $policy.$field = @{ approvedCommit = 'a' * 40; payloadPackageVersion = '2026.9.3'; gatewayTag = 'v2026.9.3' }[$field]
-                Save-Policy
-                Assert-Throws { & $workflowPath @workflow -SigningMode $mode } 'reviewed approvedCommit'
-            }
+        Invoke-Test "$mode release rejects ambiguous ref and version selectors before HTTP" {
+            Assert-Throws {
+                & $workflowPath @workflow -SigningMode $mode -Ref 'hotfix/gateway' -GatewayVersion $version
+            } 'full SHA Ref assertion'
+            Assert-Equal $http.Calls.Count 0
         }
-    }
-    foreach ($mode in @('official', 'store')) {
-        Invoke-Test "$mode explicit inputs must be the full approved SHA, not a tag or branch" {
-            foreach ($ref in @("v$version", 'main', ('a' * 40))) {
-                Assert-Throws { & $workflowPath @workflow -SigningMode $mode -Ref $ref } 'full reviewed approvedCommit'
-            }
+        Invoke-Test "$mode release rejects a mismatched GatewayVersion SHA assertion" {
+            Add-Release '2026.9.3' ('a' * 40) ('b' * 40)
+            Assert-Throws {
+                & $workflowPath @workflow -SigningMode $mode -GatewayVersion '2026.9.3' -Ref $commit
+            } 'does not match the captured GatewayVersion release'
+            Assert-Equal (Test-Path -LiteralPath $workflow.OutputPath) $false
+        }
+        Invoke-Test "$mode release cannot replay a ref override without its stable identity" {
+            $source = & $workflowPath @workflow -Ref $commit
+            $source.signingMode = $mode
+            [IO.File]::WriteAllText($workflow.OutputPath, ($source | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+            $http.Calls.Clear()
+            Assert-Throws { & $workflowPath @workflow -SigningMode $mode -Ref $commit -ReuseSnapshot } 'release identity source'
             Assert-Equal $http.Calls.Count 0
         }
     }

@@ -8,7 +8,12 @@ on:
   workflow_dispatch:
     inputs:
       openclaw_ref:
-        description: Optional stable-source ref; empty uses release-policy stable (the stableVersion pin, else npm latest); release publication still requires policy approval
+        description: Optional OpenClaw branch, tag, or full SHA to package; empty follows stable
+        required: false
+        default: ''
+        type: string
+      gateway_version:
+        description: Optional older exact stable payload; MSIX identity remains on release-policy stableVersion or npm latest
         required: false
         default: ''
         type: string
@@ -46,7 +51,10 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       packaging: ${{ steps.filter.outputs.packaging }}
+      payload_artifact: ${{ steps.filter.outputs.payload_artifact }}
+      bundle_build: ${{ steps.filter.outputs.bundle_build }}
       versioning: ${{ steps.filter.outputs.versioning }}
+      upgrade_matrix: ${{ steps.filter.outputs.upgrade_matrix }}
     steps:
       - uses: actions/checkout@v6
 
@@ -58,6 +66,8 @@ jobs:
         run: |
           if ($env:GITHUB_EVENT_NAME -ne 'pull_request') {
             'packaging=true' >> $env:GITHUB_OUTPUT
+            'payload_artifact=true' >> $env:GITHUB_OUTPUT
+            'bundle_build=true' >> $env:GITHUB_OUTPUT
             'versioning=false' >> $env:GITHUB_OUTPUT
             return
           }
@@ -76,27 +86,26 @@ jobs:
             -FileListPath $fileListPath
           "packaging=$packaging" >> $env:GITHUB_OUTPUT
 
-          $pages = Get-Content -LiteralPath $fileListPath -Raw |
-            ConvertFrom-Json
-          $versioningPaths = @(
-            'release-policy.json'
-            'scripts/OpenClawSource.ps1'
-            'scripts/Get-WorkflowSource.ps1'
-            'scripts/Test-OpenClawSource.Tests.ps1'
-            'scripts/Get-MSIXReleaseIdentity.ps1'
-            'scripts/Test-MSIXReleaseIdentity.Tests.ps1'
-            'scripts/Test-MSIXUpgrade.ps1'
-            'scripts/msix-upgrade-baselines.json'
-          )
-          $versioning = 'false'
-          foreach ($page in @($pages)) {
-            foreach ($file in @($page)) {
-              if ([string]$file.filename -in $versioningPaths) {
-                $versioning = 'true'
-              }
-            }
-          }
+          $payloadArtifact = .\scripts\Get-PackagingRelevance.ps1 `
+            -FileListPath $fileListPath `
+            -PayloadArtifact
+          "payload_artifact=$payloadArtifact" >> $env:GITHUB_OUTPUT
+
+          $versioning = .\scripts\Get-PackagingRelevance.ps1 `
+            -FileListPath $fileListPath `
+            -Versioning
           "versioning=$versioning" >> $env:GITHUB_OUTPUT
+
+          $bundleBuild = $versioning
+          if ($bundleBuild -ne 'true') {
+            $bundleBuild = .\scripts\Get-PackagingRelevance.ps1 `
+              -FileListPath $fileListPath `
+              -BundleBuild
+          }
+          "bundle_build=$bundleBuild" >> $env:GITHUB_OUTPUT
+
+          $upgradeMatrix = .\scripts\Get-MSIXUpgradeMatrix.ps1
+          "upgrade_matrix=$upgradeMatrix" >> $env:GITHUB_OUTPUT
 
   # Advisory only. This job annotates documentation-reference findings but is
   # deliberately absent from ci-gate's needs, so it can never block a merge.
@@ -277,7 +286,7 @@ jobs:
         run: >
           .\scripts\Test-Measure-Coverage.Tests.ps1
 
-      - name: Test stable source selection
+      - name: Test OpenClaw source selection
         shell: pwsh
         run: .\scripts\Test-OpenClawSource.Tests.ps1
 
@@ -290,6 +299,11 @@ jobs:
         shell: pwsh
         run: >
           .\scripts\Test-MSIXReleaseIdentity.Tests.ps1
+
+      - name: Test MSIX upgrade matrix
+        shell: pwsh
+        run: >
+          .\scripts\Test-MSIXUpgradeMatrix.Tests.ps1
 
       - name: Test MSIX bundle build
         shell: pwsh
@@ -328,7 +342,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       source_sha: ${{ steps.resolve.outputs.sha }}
-      source_tag: ${{ steps.resolve.outputs.tag }}
+      release_identity_tag: ${{ steps.resolve.outputs.release_identity_tag }}
       package_cache_key: ${{ steps.resolve.outputs.package_cache_key }}
       package_version: ${{ steps.package.outputs.version }}
       node_version: ${{ steps.package.outputs.node_version }}
@@ -352,6 +366,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_REF: ${{ inputs.openclaw_ref }}
+          GATEWAY_VERSION: ${{ inputs.gateway_version }}
           SIGNING_MODE: ${{ inputs.signing_mode || 'unsigned' }}
         run: |
           $snapshotPath = Join-Path $env:RUNNER_TEMP 'openclaw-source/source-resolution.json'
@@ -359,6 +374,7 @@ jobs:
             -PolicyPath ./release-policy.json `
             -OutputPath $snapshotPath `
             -Ref $env:SOURCE_REF `
+            -GatewayVersion $env:GATEWAY_VERSION `
             -SigningMode $env:SIGNING_MODE `
             -WorkflowRunId $env:GITHUB_RUN_ID `
             -PackagingCommit $env:GITHUB_SHA `
@@ -366,11 +382,15 @@ jobs:
           $cacheKey = .\scripts\Get-OpenClawCacheKey.ps1 `
             -Layer package `
             -Commit $source.resolvedCommit
+          $releaseIdentitySource = if ($null -ne $source.PSObject.Properties['releaseIdentitySource']) {
+            $source.releaseIdentitySource
+          }
+          else { $source }
           "sha=$($source.resolvedCommit)" >> $env:GITHUB_OUTPUT
-          "tag=v$($source.packageVersion)" >> $env:GITHUB_OUTPUT
+          "release_identity_tag=$($releaseIdentitySource.releaseTag)" >> $env:GITHUB_OUTPUT
           "version=$($source.packageVersion)" >> $env:GITHUB_OUTPUT
           "package_cache_key=$cacheKey" >> $env:GITHUB_OUTPUT
-          "OpenClaw $($source.packageVersion) ($($source.resolvedCommit)), selected by $($source.requestedRef)." >> $env:GITHUB_STEP_SUMMARY
+          "OpenClaw $($source.packageVersion) ($($source.resolvedCommit)), selected by $($source.requestedRef); release identity $($releaseIdentitySource.releaseTag)." >> $env:GITHUB_STEP_SUMMARY
 
       - name: Save immutable source selection
         if: ${{ github.run_attempt == 1 }}
@@ -568,13 +588,16 @@ jobs:
           path: ${{ runner.temp }}\openclaw-stage-${{ matrix.architecture }}
           key: ${{ steps.payload-key.outputs.key }}
 
+      # Preserve the documented branch-deployment path when this PR can
+      # change the expanded app. MSIX composition consumes the local tree.
       - name: Upload payload
+        if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.payload_artifact == 'true' }}
         uses: actions/upload-artifact@v7
         with:
           name: openclaw-gateway-payload-${{ matrix.architecture }}
           path: ${{ runner.temp }}\openclaw-payload\
           if-no-files-found: error
-          retention-days: ${{ github.event_name == 'pull_request' && 1 || 7 }}
+          retention-days: 7
 
       - name: Set up .NET
         uses: actions/setup-dotnet@v6
@@ -598,12 +621,15 @@ jobs:
             -p:PublishAot=true `
             -p:Platform='${{ matrix.architecture }}'
 
-      - name: Compose unsigned Store and sideload MSIX packages
+      # Sideload is the deployable PR artifact. Store packages exist only for
+      # bundle, upgrade, and release consumers selected by bundle_build.
+      - name: Compose unsigned Gateway MSIX packages
         shell: pwsh
         env:
+          BUILD_STORE_PACKAGE: ${{ github.event_name != 'pull_request' || needs.changes.outputs.bundle_build == 'true' }}
           SIGNING_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.signing_mode || 'unsigned' }}
           VERSIONING_CHANGE: ${{ needs.changes.outputs.versioning }}
-          GATEWAY_TAG: ${{ needs.build-package.outputs.source_tag }}
+          GATEWAY_TAG: ${{ needs.build-package.outputs.release_identity_tag }}
         run: |
           $versionParameters = @{
             RunNumber = '${{ github.run_number }}'
@@ -623,17 +649,23 @@ jobs:
           $packageVersion = .\scripts\Get-WorkflowPackageVersion.ps1 `
             @versionParameters
 
-          foreach ($channel in @('Store', 'Sideload')) {
-            .\scripts\Build-MSIX.ps1 `
-              -PayloadDirectory '${{ runner.temp }}\openclaw-payload' `
-              -Architecture '${{ matrix.architecture }}' `
-              -PackageVersion $packageVersion `
-              -SourceCommit '${{ github.sha }}' `
-              -IdentityChannel $channel `
-              -OutputDirectory "${{ runner.temp }}\openclaw-msix-$($channel.ToLowerInvariant())"
+          $packageParameters = @{
+            PayloadDirectory = '${{ runner.temp }}\openclaw-payload'
+            Architecture = '${{ matrix.architecture }}'
+            PackageVersion = $packageVersion
+            SourceCommit = '${{ github.sha }}'
+            IdentityChannel = 'Sideload'
+            OutputDirectory = '${{ runner.temp }}\openclaw-msix-sideload'
           }
+          if ($env:BUILD_STORE_PACKAGE -eq 'true') {
+            $packageParameters.IdentityChannel = 'Store'
+            $packageParameters.OutputDirectory = '${{ runner.temp }}\openclaw-msix-store'
+            $packageParameters.SideloadOutputDirectory = '${{ runner.temp }}\openclaw-msix-sideload'
+          }
+          .\scripts\Build-MSIX.ps1 @packageParameters
 
       - name: Upload unsigned Store MSIX
+        if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.bundle_build == 'true' }}
         uses: actions/upload-artifact@v7
         with:
           name: openclaw-gateway-msix-store-unsigned-${{ matrix.architecture }}
@@ -706,6 +738,7 @@ jobs:
 
   build-msix-bundle:
     name: Build unsigned Store and sideload Gateway MSIX bundles
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.bundle_build == 'true' }}
     needs:
       - changes
       - build-package
@@ -746,7 +779,7 @@ jobs:
         env:
           SIGNING_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.signing_mode || 'unsigned' }}
           VERSIONING_CHANGE: ${{ needs.changes.outputs.versioning }}
-          GATEWAY_TAG: ${{ needs.build-package.outputs.source_tag }}
+          GATEWAY_TAG: ${{ needs.build-package.outputs.release_identity_tag }}
         run: |
           $versionParameters = @{
             RunNumber = '${{ github.run_number }}'
@@ -775,6 +808,7 @@ jobs:
           }
 
       - name: Upload unsigned Store MSIX bundle
+        if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.versioning == 'true' }}
         uses: actions/upload-artifact@v7
         with:
           name: openclaw-gateway-msix-store-unsigned-bundle
@@ -783,6 +817,7 @@ jobs:
           retention-days: 7
 
       - name: Upload unsigned sideload MSIX bundle
+        if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.versioning == 'true' }}
         uses: actions/upload-artifact@v7
         with:
           name: openclaw-gateway-msix-sideload-unsigned-bundle
@@ -791,7 +826,7 @@ jobs:
           retention-days: 7
 
   test-msix-upgrades:
-    name: Test MSIX identity transition and in-place upgrades
+    name: Test MSIX upgrade (${{ matrix.name }})
     if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.versioning == 'true' }}
     needs:
       - changes
@@ -802,136 +837,98 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.upgrade_matrix) }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
         with:
           persist-credentials: false
 
-      - name: Download unsigned Store x64 candidate
+      - name: Download unsigned candidate
         uses: actions/download-artifact@v8
         with:
-          name: openclaw-gateway-msix-store-unsigned-x64
-          path: artifacts\store\x64
+          name: ${{ matrix.artifact }}
+          path: artifacts\${{ matrix.channel }}\${{ matrix.delivery_dir }}
 
-      - name: Download unsigned Store bundle candidate
-        uses: actions/download-artifact@v8
-        with:
-          name: openclaw-gateway-msix-store-unsigned-bundle
-          path: artifacts\store\bundle
-
-      - name: Download unsigned sideload x64 candidate
-        uses: actions/download-artifact@v8
-        with:
-          name: openclaw-gateway-msix-sideload-unsigned-x64
-          path: artifacts\sideload\x64
-
-      - name: Download unsigned sideload bundle candidate
-        uses: actions/download-artifact@v8
-        with:
-          name: openclaw-gateway-msix-sideload-unsigned-bundle
-          path: artifacts\sideload\bundle
-
-      - name: Apply temporary Store test signature
+      - name: Apply temporary test signature
         shell: pwsh
+        env:
+          CANDIDATE_CHANNEL: ${{ matrix.channel }}
         run: |
           .\scripts\Sign-TestMSIX.ps1 `
-            -ArtifactsDirectory artifacts\store `
-            -OutputDirectory test-signed\store `
-            -IdentityChannel store
+            -ArtifactsDirectory (Join-Path artifacts $env:CANDIDATE_CHANNEL) `
+            -OutputDirectory (Join-Path test-signed $env:CANDIDATE_CHANNEL) `
+            -IdentityChannel $env:CANDIDATE_CHANNEL
 
-      - name: Apply temporary sideload test signature
-        shell: pwsh
-        run: |
-          .\scripts\Sign-TestMSIX.ps1 `
-            -ArtifactsDirectory artifacts\sideload `
-            -OutputDirectory test-signed\sideload `
-            -IdentityChannel sideload
-
-      - name: Download hash-pinned proof releases
+      - name: Download hash-pinned proof release
+        if: ${{ matrix.transition_mode != 'store-in-place' }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          BASELINE_ASSET: ${{ matrix.baseline_asset }}
+          BASELINE_RELEASE_TAG: ${{ matrix.release_tag }}
         run: |
-          $baselines = Get-Content `
-            -LiteralPath .\scripts\msix-upgrade-baselines.json `
-            -Raw |
-            ConvertFrom-Json
           New-Item -Path baselines -ItemType Directory -Force | Out-Null
-          foreach ($baseline in $baselines.baselines) {
-            & gh release download ([string]$baseline.releaseTag) `
-              --repo $env:GITHUB_REPOSITORY `
-              --pattern ([string]$baseline.assetName) `
-              --dir baselines
-            if ($LASTEXITCODE -ne 0) {
-              throw "Unable to download $($baseline.releaseTag) upgrade baseline."
-            }
+          & gh release download $env:BASELINE_RELEASE_TAG `
+            --repo $env:GITHUB_REPOSITORY `
+            --pattern $env:BASELINE_ASSET `
+            --dir baselines
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to download $env:BASELINE_RELEASE_TAG upgrade baseline."
           }
 
-      - name: Test Store identity reset and isolated LocalState
+      - name: Test package transition
         shell: pwsh
         env:
-          GATEWAY_TAG: ${{ needs.build-package.outputs.source_tag }}
+          GATEWAY_TAG: ${{ needs.build-package.outputs.release_identity_tag }}
+          BASELINE_ASSET: ${{ matrix.baseline_asset }}
+          CANDIDATE_CHANNEL: ${{ matrix.channel }}
+          CANDIDATE_FILE: ${{ matrix.candidate_file }}
+          DELIVERY_DIRECTORY: ${{ matrix.delivery_dir }}
+          EVIDENCE_ID: ${{ matrix.id }}
+          TRANSITION_MODE: ${{ matrix.transition_mode }}
         run: |
           $policy = Get-Content -LiteralPath .\release-policy.json -Raw |
             ConvertFrom-Json
           $identity = .\scripts\Get-MSIXReleaseIdentity.ps1 `
             -GatewayTag $env:GATEWAY_TAG `
             -MSIXRevision ([int]$policy.msixRevision)
-          .\scripts\Test-MSIXUpgrade.ps1 `
-            -BaselinesPath .\scripts\msix-upgrade-baselines.json `
-            -BaselinesDirectory baselines `
-            -CandidatePackagePath test-signed\store\x64\OpenClawGateway-x64.msix `
-            -CandidateBundlePath test-signed\store\bundle\OpenClawGateway.msixbundle `
-            -CandidateCertificatePath test-signed\store\x64\OpenClawGateway-test-signing.cer `
-            -ExpectedCandidateVersion $identity.PackageVersion `
-            -TransitionMode identity-reset `
-            -EvidencePath evidence\msix-identity-reset-evidence.json
+          $candidateRoot = Join-Path `
+            (Join-Path test-signed $env:CANDIDATE_CHANNEL) `
+            $env:DELIVERY_DIRECTORY
+          $candidatePath = Join-Path $candidateRoot $env:CANDIDATE_FILE
+          $certificatePath = Join-Path `
+            $candidateRoot `
+            'OpenClawGateway-test-signing.cer'
+          $evidencePath = Join-Path evidence "$env:EVIDENCE_ID.json"
+          New-Item -Path evidence -ItemType Directory -Force | Out-Null
+          if ($env:TRANSITION_MODE -ceq 'store-in-place') {
+            .\scripts\Test-MSIXStoreUpgrade.ps1 `
+              -CandidatePath $candidatePath `
+              -CandidateCertificatePath $certificatePath `
+              -ExpectedCandidateVersion $identity.PackageVersion `
+              -StoreProductId '9NV70LV3D6XC' `
+              -EvidencePath $evidencePath
+          }
+          else {
+            .\scripts\Test-MSIXUpgrade.ps1 `
+              -BaselinesPath .\scripts\msix-upgrade-baselines.json `
+              -BaselinesDirectory baselines `
+              -CandidatePath $candidatePath `
+              -CandidateCertificatePath $certificatePath `
+              -ExpectedCandidateVersion $identity.PackageVersion `
+              -TransitionMode $env:TRANSITION_MODE `
+              -BaselineAssetName $env:BASELINE_ASSET `
+              -EvidencePath $evidencePath
+          }
 
-      - name: Test sideload in-place update and retained LocalState
-        shell: pwsh
-        env:
-          GATEWAY_TAG: ${{ needs.build-package.outputs.source_tag }}
-        run: |
-          $policy = Get-Content -LiteralPath .\release-policy.json -Raw |
-            ConvertFrom-Json
-          $identity = .\scripts\Get-MSIXReleaseIdentity.ps1 `
-            -GatewayTag $env:GATEWAY_TAG `
-            -MSIXRevision ([int]$policy.msixRevision)
-          .\scripts\Test-MSIXUpgrade.ps1 `
-            -BaselinesPath .\scripts\msix-upgrade-baselines.json `
-            -BaselinesDirectory baselines `
-            -CandidatePackagePath test-signed\sideload\x64\OpenClawGateway-x64.msix `
-            -CandidateBundlePath test-signed\sideload\bundle\OpenClawGateway.msixbundle `
-            -CandidateCertificatePath test-signed\sideload\x64\OpenClawGateway-test-signing.cer `
-            -ExpectedCandidateVersion $identity.PackageVersion `
-            -TransitionMode in-place `
-            -EvidencePath evidence\msix-in-place-upgrade-evidence.json
-
-      - name: Test authentic Store in-place update and retained LocalState
-        shell: pwsh
-        env:
-          GATEWAY_TAG: ${{ needs.build-package.outputs.source_tag }}
-        run: |
-          $policy = Get-Content -LiteralPath .\release-policy.json -Raw |
-            ConvertFrom-Json
-          $identity = .\scripts\Get-MSIXReleaseIdentity.ps1 `
-            -GatewayTag $env:GATEWAY_TAG `
-            -MSIXRevision ([int]$policy.msixRevision)
-          .\scripts\Test-MSIXStoreUpgrade.ps1 `
-            -CandidatePackagePath test-signed\store\x64\OpenClawGateway-x64.msix `
-            -CandidateBundlePath test-signed\store\bundle\OpenClawGateway.msixbundle `
-            -CandidateCertificatePath test-signed\store\x64\OpenClawGateway-test-signing.cer `
-            -ExpectedBaselineVersion '2026.9.404.0' `
-            -ExpectedCandidateVersion $identity.PackageVersion `
-            -StoreProductId '9NV70LV3D6XC' `
-            -EvidencePath evidence\msix-store-in-place-upgrade-evidence.json
-
-      - name: Upload identity-transition evidence
+      - name: Upload transition evidence
         uses: actions/upload-artifact@v7
         with:
-          name: openclaw-gateway-msix-upgrade-evidence
-          path: evidence\*.json
+          name: openclaw-gateway-msix-upgrade-evidence-${{ matrix.id }}
+          path: evidence\${{ matrix.id }}.json
           if-no-files-found: error
           retention-days: 90
 
@@ -1007,14 +1004,37 @@ jobs:
           name: openclaw-gateway-msix-sideload-unsigned-bundle
           path: artifacts\sideload\bundle
 
+      - name: Download captured source selection
+        uses: actions/download-artifact@v8
+        with:
+          name: openclaw-source-resolution
+          path: source-resolution
+
       - name: Resolve official release metadata
         id: release
         shell: pwsh
+        env:
+          SIGNING_MODE: ${{ inputs.signing_mode }}
+          SOURCE_REF: ${{ inputs.openclaw_ref }}
+          GATEWAY_VERSION: ${{ inputs.gateway_version }}
         run: |
+          $source = .\scripts\Get-WorkflowSource.ps1 `
+            -PolicyPath .\release-policy.json `
+            -OutputPath source-resolution\source-resolution.json `
+            -WorkflowRunId $env:GITHUB_RUN_ID `
+            -PackagingCommit $env:GITHUB_SHA `
+            -SigningMode $env:SIGNING_MODE `
+            -Ref $env:SOURCE_REF `
+            -GatewayVersion $env:GATEWAY_VERSION `
+            -ReuseSnapshot
           $policy = Get-Content -LiteralPath .\release-policy.json -Raw |
             ConvertFrom-Json
+          $releaseIdentitySource = if ($null -ne $source.PSObject.Properties['releaseIdentitySource']) {
+            $source.releaseIdentitySource
+          }
+          else { $source }
           $identity = .\scripts\Get-MSIXReleaseIdentity.ps1 `
-            -GatewayTag ([string]$policy.gatewayTag) `
+            -GatewayTag $releaseIdentitySource.releaseTag `
             -MSIXRevision ([int]$policy.msixRevision)
           $packageVersion = .\scripts\Get-WorkflowPackageVersion.ps1 `
             -RunNumber '${{ github.run_number }}' `
@@ -1029,7 +1049,9 @@ jobs:
       - name: Enforce reviewed release policy
         shell: pwsh
         env:
-          OPENCLAW_REF: ${{ inputs.openclaw_ref || needs.build-package.outputs.source_sha }}
+          SIGNING_MODE: ${{ inputs.signing_mode }}
+          SOURCE_REF: ${{ inputs.openclaw_ref }}
+          GATEWAY_VERSION: ${{ inputs.gateway_version }}
           PACKAGING_COMMIT: ${{ github.sha }}
         run: |
           foreach ($channel in @('Store', 'Sideload')) {
@@ -1038,7 +1060,11 @@ jobs:
               -ArtifactsDirectory "artifacts\$channelDirectory" `
               -PolicyPath .\release-policy.json `
               -BundlePath "artifacts\$channelDirectory\bundle\OpenClawGateway.msixbundle" `
-              -RequestedRef $env:OPENCLAW_REF `
+              -SourcePath source-resolution\source-resolution.json `
+              -RequestedRef $env:SOURCE_REF `
+              -GatewayVersion $env:GATEWAY_VERSION `
+              -WorkflowRunId $env:GITHUB_RUN_ID `
+              -SigningMode $env:SIGNING_MODE `
               -PackagingCommit $env:PACKAGING_COMMIT `
               -IdentityChannel $channel
           }
