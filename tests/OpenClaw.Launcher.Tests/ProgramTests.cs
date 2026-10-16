@@ -2879,10 +2879,15 @@ public sealed class ProgramTests : IDisposable
     // run narrates nothing on either, so a caller parsing standard output and
     // collecting standard error sees only the document.
     [Fact]
-    public async Task CollectLogsJsonCarriesNoNarration()
+    public async Task CollectLogsJsonKeepsTheAgentTailAndCompleteConfigurationWithoutNarration()
     {
         SessionRuntime runtime = await SetUpSessionAsync().ConfigureAwait(true);
-        RespondToCollection(_lastSessionBackend!);
+        string agentLog = "old beginning\n" +
+            new string('a', GatewayRuntime.MaximumGatewayFileBytes * 2) +
+            "\nthe last agent line\n";
+        string configText = "{\"gateway\":{\"mode\":\"local\"},\"padding\":\"" +
+            new string('c', GatewayRuntime.MaximumGatewayFileBytes + 1) + "\"}";
+        RespondToCollection(_lastSessionBackend!, agentLog, configText);
         string bundlePath = Path.Combine(_testDirectory, "structured.zip");
         using var output = new StringWriter();
         using var error = new StringWriter();
@@ -2902,6 +2907,19 @@ public sealed class ProgramTests : IDisposable
         Assert.Equal(
             "host-and-session",
             document.RootElement.GetProperty("bundle").GetProperty("included").GetString());
+        using ZipArchive archive = ZipFile.OpenRead(bundlePath);
+        using var logReader = new StreamReader(archive.GetEntry("agent/logs/openclaw-2026-09-23.log")!.Open());
+        string kept = await logReader.ReadToEndAsync().ConfigureAwait(true);
+        Assert.True(kept.Length <= GatewayRuntime.MaximumGatewayFileBytes);
+        Assert.DoesNotContain("old beginning", kept, StringComparison.Ordinal);
+        Assert.EndsWith("the last agent line\n", kept, StringComparison.Ordinal);
+        using var configReader = new StreamReader(archive.GetEntry("agent/config/openclaw.json")!.Open());
+        Assert.Equal(configText, await configReader.ReadToEndAsync().ConfigureAwait(true));
+        using var manifestReader = new StreamReader(archive.GetEntry("manifest.txt")!.Open());
+        Assert.Contains(
+            "agent/logs/openclaw-2026-09-23.log: only the last 1024 KiB of ",
+            await manifestReader.ReadToEndAsync().ConfigureAwait(true),
+            StringComparison.Ordinal);
     }
 
     private HostOptions CollectionOptions() =>
@@ -2912,7 +2930,10 @@ public sealed class ProgramTests : IDisposable
 
     // Stands in for the guest helper's collect mode: stage one log and the
     // configuration where the request asks, then report both as copied.
-    private static void RespondToCollection(FakeMxcSessionClient backend)
+    private static void RespondToCollection(
+        FakeMxcSessionClient backend,
+        string logText = "gateway ready",
+        string configText = """{"gateway":{"mode":"local"}}""")
     {
         backend.ExecuteBehavior = _ =>
         {
@@ -2923,12 +2944,12 @@ public sealed class ProgramTests : IDisposable
                 File.ReadAllText(requestPath));
             string logs = Path.Combine(request.DestinationDirectory!, "logs");
             Directory.CreateDirectory(logs);
-            File.WriteAllText(Path.Combine(logs, "openclaw-2026-09-23.log"), "gateway ready");
+            File.WriteAllText(Path.Combine(logs, "openclaw-2026-09-23.log"), logText);
             string config = Path.Combine(request.DestinationDirectory!, "config");
             Directory.CreateDirectory(config);
             File.WriteAllText(
                 Path.Combine(config, "openclaw.json"),
-                """{"gateway":{"mode":"local"}}""");
+                configText);
             File.WriteAllText(
                 SessionLaunchProtocol.ResultPathFor(requestPath),
                 SessionCollectProtocol.SerializeResult(new SessionCollectResult
