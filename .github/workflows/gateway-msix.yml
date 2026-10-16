@@ -1,4 +1,4 @@
-name: Probe disposable Windows Gateway recovery support
+name: Build isolated Gateway recovery candidate
 
 on:
   workflow_dispatch:
@@ -13,96 +13,89 @@ on:
 
 permissions:
   contents: read
+  actions: read
 cache-mode: none
 
 jobs:
-  probe:
+  candidate:
     if: inputs.signing_mode == 'test' && inputs.publish_release == false
     runs-on: windows-11-arm
     defaults:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Probe the signed baseline in this disposable account
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+      - name: Compose the assembled prerequisites through the native package owner
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
-          $evidence = Join-Path (Get-Location).Path 'artifacts/recovery-support-probe'
-          [IO.Directory]::CreateDirectory($evidence) | Out-Null
+          $root = (Get-Location).Path
+          $commit = (& git rev-parse HEAD) -join ''
+          if ($LASTEXITCODE -ne 0 -or $commit -cnotmatch '^[a-f0-9]{40}$') { throw 'The frozen source commit is invalid.' }
+          if (@(& git status --porcelain).Count -ne 0 -or $LASTEXITCODE -ne 0) { throw 'The candidate checkout must be clean.' }
           $policy = Get-Content ./release-policy.json -Raw | ConvertFrom-Json
-          $identity = $policy.sideloadPackageIdentity
-          $existing = @(
-            Get-AppxPackage -Name 'OpenClaw.Gateway*'
-            Get-AppxPackage -Name 'OpenClawFoundation.OpenClawGateway*'
-          )
-          if ($existing.Count -ne 0) { throw 'A clean disposable account is required; no existing Gateway registration will be changed.' }
-          if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne 'Arm64') { throw 'The native ARM64 proof requires an ARM64 Windows runner.' }
-          $asset = 'OpenClawGateway-2026.10.4-msix.0-arm64.msix'
-          $packagePath = Join-Path $env:RUNNER_TEMP $asset
-          Invoke-WebRequest -Uri "https://github.com/openclaw/openclaw-windows-packaging/releases/download/v2026.10.4-msix.0/$asset" -OutFile $packagePath
-          $hash = (Get-FileHash $packagePath -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($hash -cne 'a23e16b87de80a28f6eda856871c1fcd9f54d1a2194a65c282151c42d10934dd') { throw 'The immutable signed baseline hash does not match.' }
-          $signature = Get-AuthenticodeSignature -LiteralPath $packagePath
-          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -ine [string]$identity.publisher) { throw 'The baseline signature or publisher is not valid.' }
-          $owned = $false
-          $alias = $null
-          $setupExit = $null
-          $operationFailure = $null
-          $cleanupFailure = $null
-          try {
-            $owned = $true
-            Add-AppxPackage -Path $packagePath
-            $installed = @(Get-AppxPackage -Name $identity.name)
-            if ($installed.Count -ne 1 -or [string]$installed[0].PackageFamilyName -cne [string]$identity.familyName -or [string]$installed[0].Version -cne '2026.10.400.0') {
-              throw 'Windows did not register the exact baseline identity/version.'
+          $identity = & ./scripts/Get-MSIXReleaseIdentity.ps1 -GatewayTag v2026.10.4 -MSIXRevision $policy.msixRevision
+          if ($identity.PackageVersion -cne '2026.10.401.0' -or $identity.ReleaseTag -cne 'v2026.10.4-msix.1') { throw 'This proof is pinned to the requested packaging-only patch identity.' }
+          $artifactRoot = Join-Path $root 'artifacts/recovery-candidate'
+          $unsignedRoot = Join-Path $artifactRoot 'unsigned'
+          $unsigned = Join-Path $unsignedRoot 'arm64'
+          $signedRoot = Join-Path $artifactRoot 'test-signed'
+          $signed = Join-Path $signedRoot 'arm64'
+          Import-Module ./scripts/LocalPackage.psm1 -Force
+          $compose = {
+            param([string]$resolvedPayloadDirectory)
+            & dotnet restore ./src/OpenClaw.Launcher/OpenClaw.Launcher.csproj --runtime win-arm64 -p:PublishAot=true -p:IncludePackagingContent=true -p:Platform=arm64
+            if ($LASTEXITCODE -ne 0) { throw 'Launcher NativeAOT restore failed.' }
+            & dotnet restore ./src/OpenClaw.SessionHost/OpenClaw.SessionHost.csproj --runtime win-arm64 -p:PublishAot=true -p:Platform=arm64
+            if ($LASTEXITCODE -ne 0) { throw 'Session-host NativeAOT restore failed.' }
+            $build = @{
+              PayloadDirectory = $resolvedPayloadDirectory
+              Architecture = 'arm64'
+              PackageVersion = $identity.PackageVersion
+              SourceCommit = $commit
+              SourceTreeDirty = $false
+              IdentityChannel = 'Sideload'
+              OutputDirectory = $unsigned
             }
-            $alias = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\$($identity.familyName)\clawctl.exe"
-            if (-not (Test-Path -LiteralPath $alias -PathType Leaf)) { throw 'The package-qualified control alias is absent.' }
-            & $alias --version
-            if ($LASTEXITCODE -ne 0) { throw 'The installed package-qualified alias failed to execute.' }
-            & $alias setup --json > (Join-Path $evidence 'setup.json')
-            $setupExit = $LASTEXITCODE
-            if ($setupExit -ne 0) { throw "The signed baseline setup failed (exit $setupExit); inspect the setup receipt before attempting compatibility validation." }
-            & $alias status --json > (Join-Path $evidence 'status.json')
-            if ($LASTEXITCODE -ne 0) { throw 'The recorded baseline session is not ready.' }
+            & ./scripts/Build-MSIX.ps1 @build
+            if (-not (Test-Path (Join-Path $unsigned 'OpenClawGateway-arm64.msix') -PathType Leaf)) { throw 'The native package owner did not produce the candidate.' }
           }
-          catch { $operationFailure = $_.Exception.Message }
-          finally {
-            if ($owned) {
-              try {
-                $packages = @(Get-AppxPackage -Name $identity.name)
-                if ($packages.Count -gt 1 -or ($packages.Count -eq 1 -and [string]$packages[0].PackageFamilyName -cne [string]$identity.familyName)) { throw 'Cleanup refused an unexpected registration.' }
-                if ($packages.Count -eq 1) {
-                  if ($null -eq $alias) { $alias = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\$($identity.familyName)\clawctl.exe" }
-                  & $alias teardown --force --json > (Join-Path $evidence 'teardown.json')
-                  if ($LASTEXITCODE -ne 0) { throw 'Owned session teardown failed; retain its package until this disposable runner is destroyed.' }
-                  Remove-AppxPackage -Package $packages[0].PackageFullName
-                }
-              }
-              catch { $cleanupFailure = $_.Exception.Message }
-            }
-          }
+          Invoke-LocalPackageMsixBuild -RepositoryRoot $root -Architecture arm64 -PayloadRunId 38964560015 -Compose $compose
+          & ./scripts/Sign-TestMSIX.ps1 -ArtifactsDirectory $unsignedRoot -OutputDirectory $signedRoot -IdentityChannel sideload
+          $metadata = Get-Content (Join-Path $signed 'msix-metadata.json') -Raw | ConvertFrom-Json
+          if ($metadata.packagingCommit -cne $commit -or $metadata.sourceTreeDirty -or $metadata.payloadResolvedCommit -cne '383c124cc32ffee3f8e56f549b88da94d269a4af' -or $metadata.packageVersion -cne $identity.PackageVersion -or $metadata.packageFamilyName -cne $policy.sideloadPackageIdentity.familyName -or $metadata.identityChannel -cne 'sideload' -or $metadata.architecture -cne 'arm64' -or $metadata.signingType -cne 'test' -or -not $metadata.signed) { throw 'Candidate metadata does not match the frozen proof inputs.' }
+          $files = @(Get-ChildItem -LiteralPath $signed -File)
+          if ($files.Count -ne 3 -or @($files | Where-Object { $_.Extension -notin @('.msix','.json','.cer') }).Count -ne 0) { throw 'Unexpected candidate output; private signing material must not be retained.' }
+          $srcTree = (& git rev-parse 'HEAD:src') -join ''
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to record runtime source identity.' }
+          $pluginTree = (& git rev-parse 'HEAD:plugins') -join ''
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to record plugin source identity.' }
           $receipt = [ordered]@{
-            windows = [Environment]::OSVersion.VersionString
-            architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
-            baselineTag = 'v2026.10.4-msix.0'
-            baselineSha256 = $hash
-            setupExitCode = $setupExit
-            operationFailure = $operationFailure
-            cleanupFailure = $cleanupFailure
-            remainingRegistrations = @(Get-AppxPackage -Name $identity.name).Count
+            schemaVersion = 1
+            purpose = 'Disposable installed upgrade and recovery proof only; never publish this test-signed package'
+            sourceCommit = $commit
+            srcTree = $srcTree
+            pluginTree = $pluginTree
+            payloadRunId = 38964560015
+            payloadCommit = $metadata.payloadResolvedCommit
+            releaseTag = $identity.ReleaseTag
+            packageVersion = $identity.PackageVersion
+            architecture = 'arm64'
+            signingType = 'test'
+            files = @($files | ForEach-Object { [ordered]@{ name=$_.Name; length=$_.Length; sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() } })
           }
-          [IO.File]::WriteAllText((Join-Path $evidence 'probe.json'), ($receipt | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
-          if ($null -ne $operationFailure) { throw $operationFailure }
-          if ($null -ne $cleanupFailure) { throw $cleanupFailure }
-      - name: Retain the support and cleanup receipts
-        if: always()
+          [IO.File]::WriteAllText((Join-Path $signed 'proof-candidate-receipt.json'), ($receipt | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
+      - name: Retain only the test-signed candidate, public certificate, and integrity receipts
         uses: actions/upload-artifact@v7
         with:
-          name: gateway-recovery-support-probe
-          path: artifacts/recovery-support-probe
+          name: gateway-recovery-candidate-arm64-test-signed
+          path: artifacts/recovery-candidate/test-signed/arm64
           if-no-files-found: error
-          retention-days: 90
+          retention-days: 14
