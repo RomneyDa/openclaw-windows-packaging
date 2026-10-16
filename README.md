@@ -354,9 +354,10 @@ update does not remove a running process's runtime.
 `.github\workflows\gateway-msix.yml` selects **stable** whenever a new packaging
 run starts: the exact `stableVersion` when `release-policy.json` pins one,
 otherwise public npm `openclaw@latest`. The resolver checks the exact
-published version, its annotated upstream tag and target commit, and the source
-package version before building. Git tag and commit signatures are not required;
-official publication uses the same stable selection and validates its recorded
+published version, its GitHub-verified signed annotated upstream tag and target
+commit, and the source package version before building. A missing or invalid tag
+signature stops source selection; commit signatures are not required.
+Official publication uses the same stable selection and validates its recorded
 commit and version before signing. There is no automatic fallback to another
 version or channel; extended-stable and named prereleases are rejected.
 Source selection also checks the MSIX release-version rules before building:
