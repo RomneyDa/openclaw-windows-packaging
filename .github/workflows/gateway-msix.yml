@@ -407,7 +407,7 @@ jobs:
           retention-days: 90
 
   cache-proof-write:
-    name: Prove cache service permits trusted writes
+    name: Prove write-scoped cache persistence
     needs: changes
     if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.versioning == 'true' }}
     runs-on: ubuntu-latest
@@ -429,7 +429,7 @@ jobs:
           key: openclaw-cache-proof-${{ github.run_id }}-${{ github.run_attempt }}-allowed
 
   cache-proof-read:
-    name: Prove cache service rejects read-token writes
+    name: Prove read-scoped cache denial
     needs: [changes, cache-proof-write]
     if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.changes.outputs.versioning == 'true' && needs.cache-proof-write.result == 'success' }}
     runs-on: ubuntu-latest

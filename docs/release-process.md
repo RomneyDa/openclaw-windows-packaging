@@ -204,14 +204,20 @@ then dispatch a new compliant run rather than publishing partial artifacts.
 
 ## Cache-boundary cutover
 
-The configured cache token boundary needs platform proof after publication;
-local owner tests do not prove scoped-token enforcement or fresh CodeQL
-results. Official/store bypass the explicit package and payload caches, but
+Versioning PRs exercise the cache service in the PR's own ref: a write-scoped
+job persists synthetic bytes, a read-scoped job restores them and attempts a
+save with a forged client mode, and the reusable build job directly requests
+write authority with its inherited read token. The direct request must receive
+a service policy denial; an unrelated network failure is not passing proof.
+These checks do not establish main's cold/warm cutover or fresh CodeQL results.
+Official/store bypass the explicit package and payload caches, but
 setup-dotnet and nested upstream actions may still use caches under the caller
 cap. Unsigned/test arbitrary-source dispatches remain read-only even on main.
 The `cache_write` input merely avoids explicit save attempts; it is not the
 authorization boundary and cannot grant writes to a read-capped caller.
 
+Package and payload keys use format 2 to exclude their pre-boundary entries.
+Implicit NuGet, upstream, and CodeQL caches still need the coordinated reset.
 Before trusting main caches under the hardened workflow, coordinate an
 authorized activation window: let legacy writers finish, prevent racing
 legacy restores/writes, re-enumerate main-scoped cache IDs, and invalidate only

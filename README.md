@@ -425,7 +425,7 @@ Store and official workflows bypass
 both caches and always rebuild upstream source and Windows dependencies.
 
 Source preflight selects one of two callers of
-`.github\workflows\gateway-msix-build.yml`. Only validated stable selection
+`.github\workflows\gateway-msix-build.yml`. For payload builds, only validated stable selection
 from the packaging workflow on `main` grants `cache-mode: write`.
 Unsigned/test overrides (including overrides dispatched from `main`),
 non-main dispatches, and pull requests use `cache-mode: read`. They can
@@ -434,7 +434,10 @@ also covers setup-dotnet's NuGet cache and caches nested in upstream actions
 or build scripts; changing an environment variable cannot increase it.
 Signing and publication jobs use `cache-mode: none`.
 
-The cache-boundary cutover still requires coordinated legacy main-cache
+Package and payload caches use a new namespace that excludes pre-boundary
+entries. Versioning PRs exercise write/restore with synthetic bytes and attempt
+read-token writes after overriding the client's mode, including a direct
+service request from the reusable build job. The cache-boundary cutover still requires coordinated legacy main-cache
 invalidation and cold/warm CI proof before trusting existing cache contents.
 Local policy tests do not prove GitHub's token enforcement or fresh CodeQL
 results; see [release process](docs/release-process.md#cache-boundary-cutover).

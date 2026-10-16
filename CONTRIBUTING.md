@@ -147,7 +147,9 @@ the actual synthetic packages and bundles against the captured source.
 The shared build workflow inherits the caller's explicit cache token cap;
 never request write access inside it or pass signing secrets to upstream
 execution. Local checks cannot establish GitHub platform enforcement or
-CodeQL alert closure. Those checks and legacy cache reset require separately
+CodeQL alert closure. Versioning PR CI tests synthetic cache persistence,
+forged-client write denial, and the reusable job's inherited service cap.
+Main cold/warm checks and legacy cache reset require separately
 authorized CI/cutover work described in the
 [release process](docs/release-process.md#cache-boundary-cutover).
 
