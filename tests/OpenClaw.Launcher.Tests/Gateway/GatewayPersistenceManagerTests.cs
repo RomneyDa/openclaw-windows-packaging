@@ -31,7 +31,8 @@ public sealed class GatewayPersistenceManagerTests : IDisposable
     private GatewayPersistenceManager CreateManager(
         Func<string, string?>? resolveUserSid = null,
         Action<string>? deleteFile = null,
-        Action<string>? log = null) =>
+        Action<string>? log = null,
+        IWindowsScriptHostSettingsReader? scriptHostSettings = null) =>
         new(
             _scheduler,
             new GatewayPersistenceOptions(
@@ -41,7 +42,8 @@ public sealed class GatewayPersistenceManagerTests : IDisposable
                 StartupFolderPath: StartupFolder,
                 WorkingDirectory: StateRoot,
                 ScriptHostPath: @"C:\Windows\System32\wscript.exe",
-                DeleteFile: deleteFile),
+                DeleteFile: deleteFile,
+                ScriptHostSettings: scriptHostSettings),
             log,
             resolveUserSid: resolveUserSid);
 
@@ -881,6 +883,123 @@ public sealed class GatewayPersistenceManagerTests : IDisposable
         Assert.Equal(GatewayPersistenceState.Ready, install.State);
         Assert.False(File.Exists(legacy));
         Assert.Equal(GatewayPersistenceState.Ready, after.State);
+    }
+
+    private const string MachineEnabledSetting =
+        @"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Script Host\Settings\Enabled";
+
+    private const string UserEnabledSetting =
+        @"HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows Script Host\Settings\Enabled";
+
+    [Fact]
+    public async Task ADisabledScriptHostMakesAnInstalledTaskNeedAttention()
+    {
+        FakeWindowsScriptHostSettings settings = new();
+        GatewayPersistenceManager manager = CreateManager(scriptHostSettings: settings);
+        await manager.InstallAsync(CancellationToken.None);
+        Assert.Equal(
+            GatewayPersistenceState.Ready,
+            (await manager.GetStatusAsync(CancellationToken.None)).State);
+
+        settings.Set(WindowsScriptHostSettingsScope.Machine, "Enabled", 0);
+        GatewayPersistenceStatus status = await manager.GetStatusAsync(CancellationToken.None);
+
+        Assert.Equal(GatewayPersistenceState.ActionRequired, status.State);
+        Assert.Equal(GatewayPersistenceLane.TaskScheduler, status.Lane);
+        Assert.Contains("Windows Script Host is disabled", status.Message, StringComparison.Ordinal);
+        Assert.Contains(MachineEnabledSetting, status.Detail, StringComparison.Ordinal);
+        Assert.Null(status.Remediation);
+    }
+
+    [Fact]
+    public async Task ADisabledScriptHostMakesAnInstalledFallbackNeedAttention()
+    {
+        _scheduler.RegisterResult = GatewayTaskOperation.Failure("Access is denied.");
+        FakeWindowsScriptHostSettings settings = new();
+        GatewayPersistenceManager manager = CreateManager(scriptHostSettings: settings);
+        Assert.Equal(
+            GatewayPersistenceState.Ready,
+            (await manager.InstallAsync(CancellationToken.None)).State);
+
+        settings.Set(WindowsScriptHostSettingsScope.User, "Enabled", 0);
+        GatewayPersistenceStatus status = await manager.GetStatusAsync(CancellationToken.None);
+
+        Assert.Equal(GatewayPersistenceState.ActionRequired, status.State);
+        Assert.Equal(GatewayPersistenceLane.StartupFolderFallback, status.Lane);
+        Assert.Contains(UserEnabledSetting, status.Detail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task InstallDoesNotReportReadyWhileScriptHostIsDisabled()
+    {
+        FakeWindowsScriptHostSettings settings = new();
+        settings.Set(WindowsScriptHostSettingsScope.Machine, "Enabled", 0);
+        GatewayPersistenceManager manager = CreateManager(scriptHostSettings: settings);
+
+        GatewayPersistenceInstallResult install = await manager.InstallAsync(CancellationToken.None);
+        GatewayPersistenceStatus status = await manager.GetStatusAsync(CancellationToken.None);
+
+        // The task is registered; the message names the real blocker rather
+        // than claiming the registration could not be verified.
+        Assert.Equal(GatewayPersistenceState.ActionRequired, install.State);
+        Assert.Equal(GatewayPersistenceLane.TaskScheduler, install.Lane);
+        Assert.True(install.Changed);
+        Assert.Contains("Windows Script Host is disabled", install.Message, StringComparison.Ordinal);
+        Assert.Contains(MachineEnabledSetting, install.Detail, StringComparison.Ordinal);
+        Assert.Null(install.Remediation);
+        Assert.True(File.Exists(LauncherPath));
+        Assert.Equal(install.State, status.State);
+        Assert.Equal(install.Lane, status.Lane);
+    }
+
+    [Fact]
+    public async Task AFallbackInstallKeepsItsReasonWhileScriptHostIsDisabled()
+    {
+        _scheduler.RegisterResult = GatewayTaskOperation.Failure("Access is denied.");
+        FakeWindowsScriptHostSettings settings = new();
+        settings.Set(WindowsScriptHostSettingsScope.Machine, "Enabled", 0);
+        GatewayPersistenceManager manager = CreateManager(scriptHostSettings: settings);
+
+        GatewayPersistenceInstallResult install = await manager.InstallAsync(CancellationToken.None);
+
+        Assert.Equal(GatewayPersistenceState.ActionRequired, install.State);
+        Assert.Equal(GatewayPersistenceLane.StartupFolderFallback, install.Lane);
+        Assert.Contains("Access is denied.", install.Detail, StringComparison.Ordinal);
+        Assert.Contains(MachineEnabledSetting, install.Detail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AnEnabledScriptHostLeavesRecoveryReady()
+    {
+        FakeWindowsScriptHostSettings settings = new();
+        settings.Set(WindowsScriptHostSettingsScope.Machine, "Enabled", 1);
+        settings.Set(WindowsScriptHostSettingsScope.User, "Enabled", 1);
+        GatewayPersistenceManager manager = CreateManager(scriptHostSettings: settings);
+
+        GatewayPersistenceInstallResult install = await manager.InstallAsync(CancellationToken.None);
+        GatewayPersistenceStatus status = await manager.GetStatusAsync(CancellationToken.None);
+
+        Assert.Equal(GatewayPersistenceState.Ready, install.State);
+        Assert.Equal(GatewayPersistenceState.Ready, status.State);
+    }
+
+    [Fact]
+    public async Task ADisabledScriptHostDoesNotChangeStatesThatNeedNoScriptHost()
+    {
+        // Nothing is configured, so nothing depends on the script host; an
+        // unreadable task stays unknown rather than guessed in either direction.
+        FakeWindowsScriptHostSettings settings = new();
+        settings.Set(WindowsScriptHostSettingsScope.Machine, "Enabled", 0);
+        GatewayPersistenceManager manager = CreateManager(scriptHostSettings: settings);
+
+        Assert.Equal(
+            GatewayPersistenceState.NotInstalled,
+            (await manager.GetStatusAsync(CancellationToken.None)).State);
+
+        _scheduler.Probe = GatewayTaskProbe.Unreadable("Access is denied.");
+        Assert.Equal(
+            GatewayPersistenceState.Unknown,
+            (await manager.GetStatusAsync(CancellationToken.None)).State);
     }
 
     [Fact]

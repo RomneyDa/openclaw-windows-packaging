@@ -23,6 +23,9 @@ internal sealed class GatewayPersistenceManager
     /// <summary>The command a reported problem tells the user to run.</summary>
     public const string RepairCommand = "clawctl setup";
 
+    private const string ScriptHostDisabledMessage =
+        "Windows Script Host is disabled, so logon recovery cannot run.";
+
     private readonly IGatewayTaskScheduler _scheduler;
     private readonly GatewayPersistenceOptions _options;
     private readonly GatewayTaskIdentity _identity;
@@ -69,6 +72,29 @@ internal sealed class GatewayPersistenceManager
         Path.ChangeExtension(LauncherPath, ".ps1"));
 
     public async Task<GatewayPersistenceStatus> GetStatusAsync(
+        CancellationToken cancellationToken)
+    {
+        GatewayPersistenceStatus status = await ReadStatusAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (status.State != GatewayPersistenceState.Ready ||
+            FindDisabledScriptHostSetting() is not { } disabledBy)
+        {
+            return status;
+        }
+
+        return status with
+        {
+            State = GatewayPersistenceState.ActionRequired,
+            Message = ScriptHostDisabledMessage,
+            Detail = DescribeDisabledScriptHost(disabledBy),
+            Remediation = null
+        };
+    }
+
+    // Reads the task and files only. Install verifies a fresh registration with
+    // this, so a disabled script host is reported as such rather than as a
+    // registration that could not be read back.
+    private async Task<GatewayPersistenceStatus> ReadStatusAsync(
         CancellationToken cancellationToken)
     {
         GatewayTaskProbe probe = await _scheduler.QueryAsync(
@@ -211,7 +237,7 @@ internal sealed class GatewayPersistenceManager
             _log($"Registered the logon task '{_identity.Name}'.");
             // A successful schtasks write is not evidence that its normalized
             // principal and trigger match. Keep any fallback until read-back proves it.
-            GatewayPersistenceStatus verified = await GetStatusAsync(cancellationToken)
+            GatewayPersistenceStatus verified = await ReadStatusAsync(cancellationToken)
                 .ConfigureAwait(false);
             if (verified.State != GatewayPersistenceState.Ready ||
                 verified.Lane != GatewayPersistenceLane.TaskScheduler)
@@ -299,13 +325,57 @@ internal sealed class GatewayPersistenceManager
             : new GatewayGeneratedFileRemoval(false, null);
         GatewayGeneratedFileRemoval legacy = RemoveLegacyFiles();
         string? detail = Combine(fallback.Detail, legacy.Detail);
-        return result with
+        return WithScriptHostAvailability(result with
         {
             State = detail is null ? result.State : GatewayPersistenceState.ActionRequired,
             Changed = result.Changed || fallback.Changed || legacy.Changed,
             Detail = Combine(result.Detail, detail),
             Remediation = detail is null ? result.Remediation : RepairCommand
+        });
+    }
+
+    // Every Ready install outcome passes through migration, so this is the one
+    // place that keeps install from reporting Ready where status would not.
+    private GatewayPersistenceInstallResult WithScriptHostAvailability(
+        GatewayPersistenceInstallResult result)
+    {
+        if (result.State != GatewayPersistenceState.Ready ||
+            FindDisabledScriptHostSetting() is not { } disabledBy)
+        {
+            return result;
+        }
+
+        return result with
+        {
+            State = GatewayPersistenceState.ActionRequired,
+            Message = ScriptHostDisabledMessage,
+            Detail = Combine(result.Detail, DescribeDisabledScriptHost(disabledBy)),
+            Remediation = null
         };
+    }
+
+    // Reinstalling cannot fix this, so no repair command is offered. The registry
+    // is only read; changing it is the user's or the administrator's decision.
+    private static string DescribeDisabledScriptHost(string setting) =>
+        $"'{setting}' is 0, and logon recovery runs through Windows Script Host " +
+        "(wscript.exe), so it will not start the gateway at sign-in. Set the value " +
+        "to 1 or remove it (the machine-wide value needs an administrator), then run " +
+        "'clawctl gateway-service status' to confirm. OpenClaw does not change it.";
+
+    private string? FindDisabledScriptHostSetting()
+    {
+        if (_options.ScriptHostSettings is null)
+        {
+            return null;
+        }
+
+        string? setting = WindowsScriptHostPolicy.FindDisablingSetting(_options.ScriptHostSettings);
+        if (setting is not null)
+        {
+            _log($"Windows Script Host is disabled by '{setting}'.");
+        }
+
+        return setting;
     }
 
     private GatewayGeneratedFileRemoval RemoveLegacyFiles()

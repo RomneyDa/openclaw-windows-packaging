@@ -87,6 +87,10 @@ internal sealed record GatewayPersistenceRemovalResult(
 /// <param name="LogonTriggerUserSid">
 /// The interactive user whose logon starts recovery. Defaults to <paramref name="UserSid"/>.
 /// </param>
+/// <param name="ScriptHostSettings">
+/// Reads the Windows Script Host enablement settings that both recovery lanes
+/// depend on. When omitted, the host is not checked.
+/// </param>
 internal sealed record GatewayPersistenceOptions(
     string UserSid,
     string PackageFamilyName,
@@ -95,4 +99,5 @@ internal sealed record GatewayPersistenceOptions(
     string WorkingDirectory,
     string ScriptHostPath,
     Action<string>? DeleteFile = null,
-    string? LogonTriggerUserSid = null);
+    string? LogonTriggerUserSid = null,
+    IWindowsScriptHostSettingsReader? ScriptHostSettings = null);

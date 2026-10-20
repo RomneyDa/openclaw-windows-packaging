@@ -261,6 +261,24 @@ check the logon task's last-run result in Task Scheduler, the package's
 execution-alias registration, and whether Windows Script Host and JScript
 are enabled. Background recovery requires those Windows components.
 
+## Logon recovery reports that Windows Script Host is disabled
+
+**Check.** `clawctl status` and `clawctl setup` report recovery as needing
+attention and name the registry value that turns the host off:
+`HKEY_LOCAL_MACHINE` or `HKEY_CURRENT_USER`, under
+`SOFTWARE\Microsoft\Windows Script Host\Settings`, value `Enabled` set to `0`.
+Both recovery lanes run through `wscript.exe`, so with that value set the
+gateway does not start at sign-in even though the logon task or Startup-folder
+file exists. A machine-wide `IgnoreUserSettings` other than `0` makes Windows
+Script Host disregard the per-user value. The check reads the native registry
+view only, because recovery runs the system `wscript.exe`.
+
+**Fix.** Set the named value to `1` or remove it. The machine-wide value needs
+an administrator and may be enforced by policy. OpenClaw only reads these
+settings and never changes them, and reinstalling recovery does not help. Rerun
+`clawctl gateway-service status` to confirm; `clawctl collect-logs` includes the
+host log that records which value was found.
+
 ## Automatic gateway start failed after `openclaw`
 
 **Check.** Read the standard-error warning and the following
