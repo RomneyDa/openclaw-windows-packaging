@@ -76,24 +76,31 @@ internal sealed class GatewayPersistenceManager
     {
         GatewayPersistenceStatus status = await ReadStatusAsync(cancellationToken)
             .ConfigureAwait(false);
-        if (status.State != GatewayPersistenceState.Ready ||
+        if (status.State == GatewayPersistenceState.Unknown ||
             FindDisabledScriptHostSetting() is not { } disabledBy)
         {
             return status;
         }
 
-        return status with
-        {
-            State = GatewayPersistenceState.ActionRequired,
-            Message = ScriptHostDisabledMessage,
-            Detail = DescribeDisabledScriptHost(disabledBy),
-            Remediation = null
-        };
+        // With the script host disabled, install registers nothing, so a machine
+        // with no recovery is reported as needing attention too: status and
+        // setup then agree, and status exits nonzero until the host is enabled.
+        // A finding that already needs attention keeps its own message, such as a
+        // previous console launcher that still works, and gains the prerequisite.
+        return status.State == GatewayPersistenceState.ActionRequired
+            ? status with { Detail = Combine(status.Detail, DescribeDisabledScriptHost(disabledBy)) }
+            : status with
+            {
+                State = GatewayPersistenceState.ActionRequired,
+                Message = ScriptHostDisabledMessage,
+                Detail = DescribeDisabledScriptHost(disabledBy),
+                Remediation = RepairCommand
+            };
     }
 
     // Reads the task and files only. Install verifies a fresh registration with
-    // this, so a disabled script host is reported as such rather than as a
-    // registration that could not be read back.
+    // this: it already checked the script host, and a verification failure
+    // should describe the registration, not the registry.
     private async Task<GatewayPersistenceStatus> ReadStatusAsync(
         CancellationToken cancellationToken)
     {
@@ -174,6 +181,20 @@ internal sealed class GatewayPersistenceManager
     public async Task<GatewayPersistenceInstallResult> InstallAsync(
         CancellationToken cancellationToken)
     {
+        // Registering the wscript lane while Windows Script Host is disabled
+        // makes the task show a blocking dialog at every sign-in. Register and
+        // write nothing, leave any previous generation as it is, and let setup
+        // complete with a warning; status reports the same condition.
+        if (FindDisabledScriptHostSetting() is { } disabledBy)
+        {
+            return new GatewayPersistenceInstallResult(
+                GatewayPersistenceState.Ready,
+                GatewayPersistenceLane.None,
+                "Logon recovery was not configured because Windows Script Host is disabled.",
+                Changed: false,
+                Warning: DescribeDisabledScriptHost(disabledBy));
+        }
+
         bool changed;
         try
         {
@@ -325,42 +346,27 @@ internal sealed class GatewayPersistenceManager
             : new GatewayGeneratedFileRemoval(false, null);
         GatewayGeneratedFileRemoval legacy = RemoveLegacyFiles();
         string? detail = Combine(fallback.Detail, legacy.Detail);
-        return WithScriptHostAvailability(result with
+        return result with
         {
             State = detail is null ? result.State : GatewayPersistenceState.ActionRequired,
             Changed = result.Changed || fallback.Changed || legacy.Changed,
             Detail = Combine(result.Detail, detail),
             Remediation = detail is null ? result.Remediation : RepairCommand
-        });
-    }
-
-    // Every Ready install outcome passes through migration, so this is the one
-    // place that keeps install from reporting Ready where status would not.
-    private GatewayPersistenceInstallResult WithScriptHostAvailability(
-        GatewayPersistenceInstallResult result)
-    {
-        if (result.State != GatewayPersistenceState.Ready ||
-            FindDisabledScriptHostSetting() is not { } disabledBy)
-        {
-            return result;
-        }
-
-        return result with
-        {
-            State = GatewayPersistenceState.ActionRequired,
-            Message = ScriptHostDisabledMessage,
-            Detail = Combine(result.Detail, DescribeDisabledScriptHost(disabledBy)),
-            Remediation = null
         };
     }
 
-    // Reinstalling cannot fix this, so no repair command is offered. The registry
-    // is only read; changing it is the user's or the administrator's decision.
+    // Status offers the same command after the value changes: setup is
+    // idempotent, and it is the only command that configures recovery. The
+    // registry is only read; changing it is the user's or the administrator's
+    // decision.
     private static string DescribeDisabledScriptHost(string setting) =>
         $"'{setting}' is 0, and logon recovery runs through Windows Script Host " +
-        "(wscript.exe), so it will not start the gateway at sign-in. Set the value " +
-        "to 1 or remove it (the machine-wide value needs an administrator), then run " +
-        "'clawctl gateway-service status' to confirm. OpenClaw does not change it.";
+        "(wscript.exe). While it is disabled, setup does not register logon " +
+        "recovery, and a registered wscript task shows a blocking dialog at " +
+        "sign-in instead of starting the gateway. Set the value to 1 or remove " +
+        "it (the machine-wide value needs an administrator and may be set by " +
+        $"Group Policy or other management), then run '{RepairCommand}' to " +
+        "configure logon recovery. OpenClaw does not change it.";
 
     private string? FindDisabledScriptHostSetting()
     {

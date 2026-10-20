@@ -263,20 +263,26 @@ are enabled. Background recovery requires those Windows components.
 
 ## Logon recovery reports that Windows Script Host is disabled
 
-**Check.** `clawctl status` and `clawctl setup` report recovery as needing
-attention and name the registry value that turns the host off:
+**Check.** `clawctl status` reports recovery as needing attention (and exits 1),
+and `clawctl setup` finishes with exit 0 but shows its Recovery line as needing
+attention. Both name the registry value that turns the host off:
 `HKEY_LOCAL_MACHINE` or `HKEY_CURRENT_USER`, under
 `SOFTWARE\Microsoft\Windows Script Host\Settings`, value `Enabled` set to `0`.
-Both recovery lanes run through `wscript.exe`, so with that value set the
-gateway does not start at sign-in even though the logon task or Startup-folder
-file exists. A machine-wide `IgnoreUserSettings` other than `0` makes Windows
-Script Host disregard the per-user value. The check reads the native registry
-view only, because recovery runs the system `wscript.exe`.
+Both recovery lanes run through `wscript.exe`. With the host disabled, Windows
+shows a blocking "Windows Script Host" dialog at sign-in and the logon task never
+finishes, so setup registers neither the logon task nor the Startup-folder file,
+writes no launcher, and leaves an existing previous registration exactly as it
+was. If recovery from this package is already registered and the host is disabled
+later, status reports it the same way and changes nothing. OpenClaw itself still
+works: start the gateway yourself with `clawctl gateway-service start`. A
+machine-wide `IgnoreUserSettings` other than `0` makes Windows Script Host
+disregard the per-user value. The check reads the native registry view only,
+because recovery runs the system `wscript.exe`.
 
 **Fix.** Set the named value to `1` or remove it. The machine-wide value needs
-an administrator and may be enforced by policy. OpenClaw only reads these
-settings and never changes them, and reinstalling recovery does not help. Rerun
-`clawctl gateway-service status` to confirm; `clawctl collect-logs` includes the
+an administrator and may be set by Group Policy or other management. OpenClaw
+only reads these settings and never changes them. Afterward, run
+`clawctl setup` to configure logon recovery; `clawctl collect-logs` includes the
 host log that records which value was found.
 
 ## Automatic gateway start failed after `openclaw`

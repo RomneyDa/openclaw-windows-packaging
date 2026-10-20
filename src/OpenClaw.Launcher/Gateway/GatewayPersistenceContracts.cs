@@ -44,13 +44,19 @@ internal sealed record GatewayPersistenceStatus(
     string? Detail = null,
     string? Remediation = null);
 
+/// <summary>
+/// The outcome of an explicit recovery install. <c>Warning</c> is set when
+/// recovery is registered, so setup may complete, but it cannot run until the
+/// user acts; status reports the same condition as action required.
+/// </summary>
 internal sealed record GatewayPersistenceInstallResult(
     GatewayPersistenceState State,
     GatewayPersistenceLane Lane,
     string Message,
     bool Changed,
     string? Detail = null,
-    string? Remediation = null);
+    string? Remediation = null,
+    string? Warning = null);
 
 internal sealed record GatewayPersistenceRemovalResult(
     bool Succeeded,

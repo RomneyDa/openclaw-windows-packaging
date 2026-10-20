@@ -617,21 +617,15 @@ internal static class ClawCtlConsole
 
         if (result.Recovery is not null)
         {
-            view.Row(
-                "Recovery",
-                result.Recovery.State == Gateway.GatewayPersistenceState.Ready
-                    ? Status(
-                        view,
-                        StatusKind.Success,
-                        "configured",
-                        " - the gateway starts when you sign in")
-                    : Status(
-                        view,
-                        StatusKind.Failure,
-                        DescribeRecoveryState(result.Recovery.State)));
+            view.Row("Recovery", DescribeSetupRecovery(view, result.Recovery));
             if (!string.IsNullOrWhiteSpace(result.Recovery.Detail))
             {
                 view.Detail(result.Recovery.Detail);
+            }
+
+            if (!string.IsNullOrWhiteSpace(result.Recovery.Warning))
+            {
+                view.Detail(result.Recovery.Warning);
             }
         }
 
@@ -1000,6 +994,24 @@ internal static class ClawCtlConsole
             Gateway.GatewayPersistenceState.ActionRequired =>
                 Status(view, StatusKind.Warning, "needs attention"),
             _ => Status(view, StatusKind.Warning, "unknown")
+        };
+
+    // A registered recovery that cannot run yet still lets setup finish, so its
+    // row says so rather than claiming the gateway starts at sign-in.
+    private static Paragraph DescribeSetupRecovery(
+        ResultView view,
+        Gateway.GatewayPersistenceInstallResult recovery) =>
+        recovery switch
+        {
+            { State: Gateway.GatewayPersistenceState.Ready, Warning: not null } =>
+                Status(view, StatusKind.Warning, "needs attention"),
+            { State: Gateway.GatewayPersistenceState.Ready } =>
+                Status(
+                    view,
+                    StatusKind.Success,
+                    "configured",
+                    " - the gateway starts when you sign in"),
+            _ => Status(view, StatusKind.Failure, DescribeRecoveryState(recovery.State))
         };
 
     private static string DescribeRecoveryState(
