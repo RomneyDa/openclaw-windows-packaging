@@ -29,7 +29,7 @@ if ($GatewayVersion -ne '') {
 }
 $null = Get-OpenClawBuildRoute -WorkflowRef $WorkflowRef -GitHubRef $GitHubRef `
     -EventName $EventName -SigningMode $SigningMode -Channel ''
-$releaseMode = $SigningMode -in @('official', 'store')
+$releaseMode = $SigningMode -in @('test', 'official', 'store')
 $refAssertion = $releaseMode -and $GatewayVersion -ne '' -and $Ref -ne ''
 if ($Ref -ne '' -and $GatewayVersion -ne '') {
     if (-not $refAssertion) {

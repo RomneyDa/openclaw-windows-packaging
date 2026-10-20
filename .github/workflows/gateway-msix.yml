@@ -49,7 +49,7 @@ env:
 
 jobs:
   changes:
-    name: Classify pull request changes
+    name: Select Gateway MSIX validation
     runs-on: ubuntu-latest
     outputs:
       packaging: ${{ steps.filter.outputs.packaging }}
@@ -65,12 +65,22 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          SIGNING_MODE: ${{ inputs.signing_mode || 'unsigned' }}
         run: |
+          $upgradeMatrix = .\scripts\Get-MSIXUpgradeMatrix.ps1
+          "upgrade_matrix=$upgradeMatrix" >> $env:GITHUB_OUTPUT
+
           if ($env:GITHUB_EVENT_NAME -ne 'pull_request') {
             'packaging=true' >> $env:GITHUB_OUTPUT
             'payload_artifact=true' >> $env:GITHUB_OUTPUT
             'bundle_build=true' >> $env:GITHUB_OUTPUT
-            'versioning=false' >> $env:GITHUB_OUTPUT
+            # Test dispatches prove the release candidate without publication.
+            # Push and unsigned dispatches retain development package versions.
+            $versioning = (
+              $env:GITHUB_EVENT_NAME -eq 'workflow_dispatch' -and
+              $env:SIGNING_MODE -in @('test', 'store', 'official')
+            )
+            "versioning=$($versioning.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
             return
           }
 
@@ -105,9 +115,6 @@ jobs:
               -BundleBuild
           }
           "bundle_build=$bundleBuild" >> $env:GITHUB_OUTPUT
-
-          $upgradeMatrix = .\scripts\Get-MSIXUpgradeMatrix.ps1
-          "upgrade_matrix=$upgradeMatrix" >> $env:GITHUB_OUTPUT
 
   # Advisory only. This job annotates documentation-reference findings but is
   # deliberately absent from ci-gate's needs, so it can never block a merge.
@@ -610,7 +617,7 @@ jobs:
   test-msix-upgrades:
     cache-mode: none
     name: Test MSIX upgrade (${{ matrix.name }})
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.changes.result == 'success' && needs.changes.outputs.versioning == 'true' && needs.test-host.result == 'success' && needs.build.result == 'success' }}
+    if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && needs.changes.result == 'success' && needs.changes.outputs.versioning == 'true' && needs.test-host.result == 'success' && needs.build.result == 'success' }}
     needs:
       - changes
       - test-host
@@ -730,10 +737,11 @@ jobs:
   authorize-signing:
     cache-mode: none
     name: Authorize Gateway MSIX release
-    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && (inputs.signing_mode == 'official' || inputs.signing_mode == 'store') && github.ref == 'refs/heads/main' && needs.test-host.result == 'success' && needs.build.result == 'success' }}
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && (inputs.signing_mode == 'official' || inputs.signing_mode == 'store') && github.ref == 'refs/heads/main' && needs.test-host.result == 'success' && needs.build.result == 'success' && needs.test-msix-upgrades.result == 'success' }}
     needs:
       - test-host
       - build
+      - test-msix-upgrades
     runs-on: windows-latest
     outputs:
       package_version: ${{ steps.release.outputs.package_version }}
@@ -1134,11 +1142,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Require versioning upgrade tests
+      - name: Require candidate upgrade tests
         if: ${{ always() }}
         shell: pwsh
         env:
           EVENT_NAME: ${{ github.event_name }}
+          SIGNING_MODE: ${{ inputs.signing_mode || 'unsigned' }}
           VERSIONING: ${{ needs.changes.outputs.versioning }}
           CHANGES_RESULT: ${{ needs.changes.result }}
           TEST_HOST_RESULT: ${{ needs.test-host.result }}
@@ -1147,6 +1156,7 @@ jobs:
         run: |
           ./scripts/Assert-WorkflowJobResults.ps1 `
             -EventName $env:EVENT_NAME `
+            -SigningMode $env:SIGNING_MODE `
             -Versioning $env:VERSIONING `
             -ChangesResult $env:CHANGES_RESULT `
             -TestHostResult $env:TEST_HOST_RESULT `

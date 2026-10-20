@@ -139,9 +139,11 @@ upload step logs before relying on the results.
 
 The source-selection tests use offline npm and GitHub fixtures to exercise
 snapshot capture/replay, bound workflow context, and trusted versus read-only
-routes. `Test-WorkflowSigningConfiguration.ps1` executes the selected-build
-owner: exactly one route must succeed and its outputs must match preflight.
-It no longer inspects YAML fragments. The signing-input suite validates
+routes. `Test-WorkflowSigningConfiguration.ps1` executes the workflow classifier
+and selected-build owner: release-candidate dispatches select the full upgrade
+matrix, exactly one build route must succeed, and its outputs must match preflight.
+`Test-WorkflowJobResults.Tests.ps1` checks the final upgrade-proof requirement.
+The signing-input suite validates
 the actual synthetic packages and bundles against the captured source.
 
 The shared build workflow inherits the caller's explicit cache token cap;

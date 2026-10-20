@@ -19,7 +19,7 @@ function Assert-Rejected {
         }
         return
     }
-    throw 'An eligible versioning pull request accepted an unsuccessful upgrade job.'
+    throw 'An eligible release candidate or versioning pull request accepted an unsuccessful upgrade job.'
 }
 
 $base = @{
@@ -49,6 +49,27 @@ foreach ($result in @('skipped', 'failure', 'cancelled')) {
 Invoke-Validator @{
     EventName = 'workflow_dispatch'
     Versioning = ''
+    UpgradeResult = 'skipped'
+}
+foreach ($mode in @('test', 'store', 'official')) {
+    Invoke-Validator @{
+        EventName = 'workflow_dispatch'
+        SigningMode = $mode
+        Versioning = 'true'
+        UpgradeResult = 'success'
+    }
+    foreach ($result in @('skipped', 'failure', 'cancelled')) {
+        $arguments = $base.Clone()
+        $arguments.EventName = 'workflow_dispatch'
+        $arguments.SigningMode = $mode
+        $arguments.Versioning = 'false'
+        $arguments.UpgradeResult = $result
+        Assert-Rejected $arguments
+    }
+}
+Invoke-Validator @{
+    EventName = 'push'
+    Versioning = 'false'
     UpgradeResult = 'skipped'
 }
 Invoke-Validator @{

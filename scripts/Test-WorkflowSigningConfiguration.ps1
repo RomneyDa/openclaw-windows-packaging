@@ -82,7 +82,7 @@ $selected = & $selector -PackagingExpected $true -ExpectedRoute trusted -Expecte
 if ($selected.release_identity_tag -cne 'v2026.9.8') { throw 'The selected release identity changed.' }
 $outputs.release_identity_tag = $savedIdentity
 $expectedSource.release_identity_tag = $savedIdentity
-# Arbitrary unsigned/test refs have no release identity. Actions can omit an
+# Arbitrary unsigned refs have no release identity. Actions can omit an
 # empty job output from needs while retaining it on the reusable workflow.
 $outputs.release_identity_tag = ''
 $expectedSource.release_identity_tag = ''
@@ -121,3 +121,104 @@ Assert-Rejected {
         -Trusted ([pscustomobject]@{ result = 'success'; outputs = [pscustomobject]@{} }) -ReadOnly $skipped
 } 'Missing required field'
 Write-Host 'Workflow build selection contracts passed (source/signing contracts run in their owning suites).'
+
+$repositoryRoot = Split-Path $PSScriptRoot -Parent
+$workflowPath = Join-Path $repositoryRoot '.github/workflows/gateway-msix.yml'
+$workflow = Get-Content -LiteralPath $workflowPath -Raw
+$classificationStep = [regex]::Match(
+    $workflow,
+    '(?ms)^      - name: Detect packaging changes\r?\n' +
+        '.*?^        run: \|\r?\n' +
+        '(?<script>(?:^ {10}[^\r\n]*\r?\n|^\r?\n)+)'
+)
+if (-not $classificationStep.Success) {
+    throw 'Unable to locate the workflow classification script.'
+}
+$classificationScript = [scriptblock]::Create(
+    [regex]::Replace(
+        $classificationStep.Groups['script'].Value,
+        '(?m)^ {10}',
+        ''
+    ).Replace('${{ github.event.pull_request.number }}', '1')
+)
+
+# Execute the production classifier with fixture inputs; non-PR events must
+# select the candidate version and full matrix without querying GitHub.
+function Assert-WorkflowClassification {
+    param(
+        [string]$EventName,
+        [string]$SigningMode,
+        [bool]$ExpectedVersioning
+    )
+
+    function gh {
+        throw 'Non-PR classification must not query pull-request files.'
+    }
+
+    $outputPath = Join-Path ([IO.Path]::GetTempPath()) (
+        "openclaw-workflow-classification-$([guid]::NewGuid().ToString('N'))"
+    )
+    $savedEnvironment = @{}
+    foreach ($name in @('GITHUB_EVENT_NAME', 'GITHUB_OUTPUT', 'SIGNING_MODE')) {
+        $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
+    }
+    $location = Get-Location
+    try {
+        Set-Location -LiteralPath $repositoryRoot
+        $env:GITHUB_EVENT_NAME = $EventName
+        $env:GITHUB_OUTPUT = $outputPath
+        $env:SIGNING_MODE = $SigningMode
+        & $classificationScript
+
+        $outputs = @{}
+        foreach ($line in [IO.File]::ReadAllLines($outputPath)) {
+            $entry = $line.Split('=', 2)
+            if ($entry.Count -ne 2 -or $outputs.ContainsKey($entry[0])) {
+                throw "Invalid or duplicate workflow output: $line"
+            }
+            $outputs[$entry[0]] = $entry[1]
+        }
+        foreach ($name in @('packaging', 'payload_artifact', 'bundle_build')) {
+            if ($outputs[$name] -cne 'true') {
+                throw "$EventName/$SigningMode did not select $name."
+            }
+        }
+        $expected = $ExpectedVersioning.ToString().ToLowerInvariant()
+        if ($outputs['versioning'] -cne $expected) {
+            throw (
+                "$EventName/$SigningMode expected versioning=$expected; " +
+                "received '$($outputs['versioning'])'."
+            )
+        }
+        if (-not $outputs.ContainsKey('upgrade_matrix')) {
+            throw "$EventName/$SigningMode did not emit the upgrade matrix."
+        }
+        $matrix = $outputs['upgrade_matrix'] | ConvertFrom-Json
+        if (@($matrix.include).Count -ne 13) {
+            throw "$EventName/$SigningMode did not select all upgrade scenarios."
+        }
+    }
+    finally {
+        Set-Location -LiteralPath $location.Path
+        foreach ($name in $savedEnvironment.Keys) {
+            [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name])
+        }
+        Remove-Item -LiteralPath $outputPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+foreach ($mode in @('test', 'store', 'official')) {
+    Assert-WorkflowClassification `
+        -EventName workflow_dispatch `
+        -SigningMode $mode `
+        -ExpectedVersioning $true
+}
+Assert-WorkflowClassification `
+    -EventName workflow_dispatch `
+    -SigningMode unsigned `
+    -ExpectedVersioning $false
+Assert-WorkflowClassification `
+    -EventName push `
+    -SigningMode unsigned `
+    -ExpectedVersioning $false
+Write-Host 'Workflow dispatch classification contracts passed.'
