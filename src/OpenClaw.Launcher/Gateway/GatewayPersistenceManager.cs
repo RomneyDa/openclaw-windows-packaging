@@ -90,7 +90,7 @@ internal sealed class GatewayPersistenceManager
 
         if (probe.Presence == GatewayTaskPresence.Missing)
         {
-            if (File.Exists(Path.ChangeExtension(FallbackPath, ".cmd")))
+            if (OwnsLegacyFallback())
             {
                 return new GatewayPersistenceStatus(
                     GatewayPersistenceState.ActionRequired,
@@ -530,14 +530,34 @@ internal sealed class GatewayPersistenceManager
     private GatewayGeneratedFileRemoval RemoveActivationScript() =>
         RemoveGeneratedFile(ActivationScriptPath);
 
+    // The one ownership test: only a file carrying a generator marker is ours.
+    // Status and removal share it so they cannot disagree about a legacy file.
+    private static bool IsGenerated(string path) =>
+        File.Exists(path) &&
+        GatewayLauncherScript.LooksGenerated(File.ReadAllText(path));
+
+    // An unreadable legacy file is treated as owned: install reports the same
+    // file as a failed cleanup, so status and install stay consistent.
+    private bool OwnsLegacyFallback()
+    {
+        try
+        {
+            return IsGenerated(Path.ChangeExtension(FallbackPath, ".cmd"));
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException)
+        {
+            return true;
+        }
+    }
+
     private GatewayGeneratedFileRemoval RemoveGeneratedFile(string path)
     {
         // Only a file this installation generated is deleted. A same-named file
         // someone else placed there is left alone.
         try
         {
-            if (!File.Exists(path) ||
-                !GatewayLauncherScript.LooksGenerated(File.ReadAllText(path)))
+            if (!IsGenerated(path))
             {
                 return new GatewayGeneratedFileRemoval(false, null);
             }

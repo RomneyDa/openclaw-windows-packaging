@@ -841,6 +841,49 @@ public sealed class GatewayPersistenceManagerTests : IDisposable
     }
 
     [Fact]
+    public async Task AnUnownedLegacyFallbackCmdDoesNotMakeTheInstalledFallbackNeedAttention()
+    {
+        // Registration is refused, so the Startup-folder WSF is the lane. A CMD
+        // with the legacy name that this installation did not generate is the
+        // user's file: install preserves it, so status must not demand a
+        // reinstall that cannot remove it.
+        _scheduler.RegisterResult = GatewayTaskOperation.Failure("Access is denied.");
+        GatewayPersistenceManager manager = CreateManager();
+        Directory.CreateDirectory(StartupFolder);
+        string unowned = Path.ChangeExtension(manager.FallbackPath, ".cmd");
+        const string userContent = "@echo off\r\nrem a user's own startup helper\r\n";
+        await File.WriteAllTextAsync(unowned, userContent);
+
+        GatewayPersistenceInstallResult install = await manager.InstallAsync(CancellationToken.None);
+        GatewayPersistenceStatus status = await manager.GetStatusAsync(CancellationToken.None);
+
+        Assert.Equal(GatewayPersistenceState.Ready, install.State);
+        Assert.Equal(GatewayPersistenceState.Ready, status.State);
+        Assert.Equal(GatewayPersistenceLane.StartupFolderFallback, status.Lane);
+        Assert.Equal(userContent, await File.ReadAllTextAsync(unowned));
+    }
+
+    [Fact]
+    public async Task AGeneratedLegacyFallbackCmdIsReportedThenRemovedByAFallbackInstall()
+    {
+        _scheduler.RegisterResult = GatewayTaskOperation.Failure("Access is denied.");
+        GatewayPersistenceManager manager = CreateManager();
+        Directory.CreateDirectory(StartupFolder);
+        string legacy = Path.ChangeExtension(manager.FallbackPath, ".cmd");
+        await File.WriteAllTextAsync(legacy, GatewayLauncherScript.Marker);
+
+        GatewayPersistenceStatus before = await manager.GetStatusAsync(CancellationToken.None);
+        GatewayPersistenceInstallResult install = await manager.InstallAsync(CancellationToken.None);
+        GatewayPersistenceStatus after = await manager.GetStatusAsync(CancellationToken.None);
+
+        Assert.Equal(GatewayPersistenceState.ActionRequired, before.State);
+        Assert.Equal(GatewayPersistenceManager.RepairCommand, before.Remediation);
+        Assert.Equal(GatewayPersistenceState.Ready, install.State);
+        Assert.False(File.Exists(legacy));
+        Assert.Equal(GatewayPersistenceState.Ready, after.State);
+    }
+
+    [Fact]
     public async Task TheLauncherEntersAControlledWorkingDirectory()
     {
         // At logon the task's working directory is the system directory.
