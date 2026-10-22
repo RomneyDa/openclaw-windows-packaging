@@ -69,13 +69,15 @@ internal sealed record MxcReadinessReport(
                 ? $"failed ({failure})"
                 : "not run";
         return $"{HostSupport} from {SupportEvidence} evidence; host build " +
-            $"{HostBuild?.ToString() ?? "unknown"}; runtime {runtime}; backend probe {probe}";
+            $"{HostBuild?.ToString() ?? "unknown"}; runtime {runtime}; backend probe {probe}" +
+            (BackendProbe?.NativeVersion is { Length: > 0 } nativeVersion
+                ? $"; native version {nativeVersion}" : string.Empty);
     }
 }
 
 /// <summary>
-/// Read-only MXC prerequisite probe. It inspects the staged runtime, asks the
-/// runtime's own capability detector about the host, and falls back to the
+/// Read-only MXC prerequisite probe. It asks the SDK's capability detector
+/// about the host and falls back to the
 /// documented minimum build when that detector cannot run. It never provisions,
 /// starts, or otherwise mutates state.
 /// </summary>
@@ -105,11 +107,9 @@ internal static class MxcReadiness
     public static Task<MxcReadinessReport> ProbeAsync(
         CancellationToken cancellationToken) =>
         ProbeAsync(
-            AppContext.BaseDirectory,
-            Environment.GetEnvironmentVariable,
+            MxcRuntimeLocator.Locate,
             WindowsHostBuild.TryRead,
-            static (location, token) =>
-                new MxcCliSessionClient(location).ProbeBackendAsync(token),
+            MxcSdkSessionClient.ProbeBackendAsync,
             cancellationToken);
 
     [SuppressMessage(
@@ -123,8 +123,7 @@ internal static class MxcReadiness
             "this would instead make `clawctl setup` fail on a machine it was " +
             "only being asked to describe.")]
     internal static async Task<MxcReadinessReport> ProbeAsync(
-        string baseDirectory,
-        Func<string, string?> readEnvironmentVariable,
+        Func<MxcRuntimeLocation> locateRuntime,
         Func<MxcHostBuild?> readHostBuild,
         Func<MxcRuntimeLocation, CancellationToken, Task<MxcBackendProbe>> probeBackend,
         CancellationToken cancellationToken)
@@ -136,9 +135,7 @@ internal static class MxcReadiness
 
         try
         {
-            location = MxcRuntimeLocator.Locate(
-                baseDirectory,
-                readEnvironmentVariable);
+            location = locateRuntime();
             runtimeDirectory = location.Directory;
             provenance = location.Provenance;
         }
@@ -161,6 +158,10 @@ internal static class MxcReadiness
             catch (MxcException exception)
             {
                 probeFailure = exception.Message;
+                if (exception.Code == MxcErrorCode.RuntimeUnavailable)
+                {
+                    unavailableReason = exception.Message;
+                }
             }
             catch (OperationCanceledException)
             {

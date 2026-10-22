@@ -125,6 +125,11 @@ both identities. This is a required execution bridge, not a caching or startup
 optimization; staging verifies the packaged source and reports a staging
 failure rather than silently substituting another executable.
 
+Before starting an attached child, the helper initializes its own console's
+input and output to UTF-8. Host-side encoding does not set the isolated
+console's code page; without guest initialization, PowerShell can corrupt
+Unicode terminal and redirected text.
+
 ```mermaid
 sequenceDiagram
     participant Host as Package host
@@ -143,23 +148,76 @@ sequenceDiagram
     Host->>Shared: Read result
 ```
 
-## Packaging verifies MXC; MXC provides isolation
+## Packaging consumes the SDK API; MXC provides isolation
 
 The boundary with MXC has two responsibilities that should not be conflated:
 
-- Packaging pins and verifies the native runtime. [`mxc-runtime.lock.json`](../mxc-runtime.lock.json)
-  records the selected package and integrity information. [`Get-MxcRuntime.ps1`](../scripts/Get-MxcRuntime.ps1)
-  obtains that exact archive, verifies registry integrity, and checks the
-  allowlisted extracted files' hashes, lengths, and machine architecture.
+- [`Directory.Packages.props`](../Directory.Packages.props) selects the
+  official `Microsoft.Mxc.Sdk` NuGet version.
+  NuGet and the .NET build/publish pipeline acquire and copy its runtime assets;
+  the SDK owns native library resolution. Packaging does not register a custom
+  resolver, inspect a native file set, or maintain per-binary pins.
+  [`Get-MxcSdkMetadata.ps1`](../scripts/Get-MxcSdkMetadata.ps1) copies the
+  mandatory MIT copyright/permission notice and records descriptive package
+  version and build architecture, not a native-binary inventory.
   [`MxcRuntimeLocator`](../src/OpenClaw.Launcher/Mxc/MxcRuntimeLocator.cs)
-  resolves the packaged runtime rather than searching `PATH` or a
-  user-writable directory.
-- MXC owns the containment implementation. [`MxcCliSessionClient`](../src/OpenClaw.Launcher/Mxc/MxcCliSessionClient.cs)
-  is the host adapter to the pinned executor, while
-  [`MxcWireProtocol`](../src/OpenClaw.Launcher/Mxc/MxcWireProtocol.cs)
-  confines the versioned preview request and response envelopes to one place.
-  Its isolation-session wire schema is independently versioned from the npm
-  package pin.
+  reads that optional metadata for diagnostics only. Availability is observed
+  through SDK calls and their errors, never inferred from file presence.
+- MXC owns containment and its wire contract.
+  [`MxcSdkSessionClient`](../src/OpenClaw.Launcher/Mxc/MxcSdkSessionClient.cs)
+  calls `Microsoft.Mxc.Sdk.V1.MxcLifecycle` in process and translates typed
+  results/errors into the package-owned lifecycle boundary. There is no
+  executor process or package-authored MXC JSON envelope.
+
+Interactive foreground commands use the SDK's public PTY API, with the host
+bridging input/output, terminal size, and console restoration. Redirected or
+mixed streams use separate pipes; helper capture closes unused stdin and
+drains both output streams concurrently. The tagged IsolationSession SDK kill
+reaches only its foreground command processor, not the guest helper's tree.
+
+This branch prototypes per-invocation cleanup with
+[`WindowsInvocationJob`](../src/OpenClaw.Launcher/WindowsInvocationJob.cs).
+The host creates a job and per-invocation lifecycle events. The helper's internal
+`--request-in-job=<id>` mode joins the job before starting any workload, then
+checks the event so a delayed, already-cancelled spawn cannot start late work.
+An outside-job helper coordinator uses query-only job access and its agent
+identity to pin member process handles.
+Console Ctrl+C and Ctrl+Break leave that coordinator alive to finish pinning
+and drain acknowledgement; its process-local handler is not inherited by the
+worker, which retains normal console interruption behavior.
+Cancellation and normal completion
+close process admission before that snapshot by lowering the active-process
+limit to one; existing members remain available to pin, but new child creation
+is refused. The host explicitly terminates only after pinning is acknowledged.
+The coordinator waits the pinned handles, including its worker helper, before
+acknowledging drain and exiting. Only then does the SDK adapter join output
+EOF and release invocation files. Detached gateway supervision is unchanged.
+
+The earlier zero-member/completion-packet candidate failed strict process-handle
+exit proof. The coordinator replaces that discovery path rather than treating
+job accounting as completed process exit. A positive member PID from that
+post-admission snapshot is opened with the fixed query-limited/synchronization
+mask. Only `ERROR_INVALID_PARAMETER` (87) identifies an already-expired PID in
+this context, following the same .NET process-lifetime handling. Access denial,
+other native errors, invalid snapshot IDs, and valid handles that no longer
+belong to the exact job remain explicit failures. Every retained handle still
+requires a signaled wait; no exit-code or job-count shortcut replaces it.
+Failed drain closes supported SDK output readers before joining them; closing
+readers does not count as process exit. The agent receives no host-process
+duplication or job-termination access.
+
+This is ordinary process-leak control, not an authorization boundary against
+hostile same-identity code. Explicit termination does not depend on the last
+job handle closing; kill-on-close remains only a host-death fallback and is not
+guaranteed against retained handles. Older helpers reject the new
+`--coordinate-invocation=<id>` mode without starting a workload. The JSON
+protocol version is unchanged; the branch-local modes and events require a
+matching host/helper. Local regressions, managed quality, the full Release
+suite, and the observed cross-identity NativeAOT scenarios pass; the remaining
+limits and unrun lanes are recorded in the
+[operational evidence](mxc-compatibility-evidence.md#branch-local-descendant-cancellation-prototype).
+Dispatched lifecycle calls are not abandoned, so a provision's identity can
+always be recorded.
 
 The result is a narrow trust boundary: this repository decides exactly which
 runtime is packaged and verifies it, but does not reimplement MXC's process
@@ -336,7 +394,7 @@ Each host start records an `Environment:` entry from
 build and update revision, OS and process architecture, the package full name
 with the origin Windows recorded for the install (Developer Mode loose-layout
 registration, Store-signed, or developer-signed MSIX) and its install path, the
-compiled package and payload versions, the staged MXC runtime and wire schema,
+compiled package and payload versions, the MXC SDK provenance and owned contract,
 the packaged Node.js version, and the .NET runtime. Reading these facts starts
 no process; the MXC backend probe is logged where support is checked instead.
 The facts are descriptive only and never authorize an operation.
@@ -401,7 +459,7 @@ flowchart LR
 | Package applications, aliases, and launcher dispatch | [`Package.appxmanifest`](../src/OpenClaw.Launcher/Package.appxmanifest), [`HostEntrypoint.cs`](../src/OpenClaw.Launcher/HostEntrypoint.cs), [`HostStartup.cs`](../src/OpenClaw.Launcher/HostStartup.cs), [`Program.cs`](../src/OpenClaw.Launcher/Program.cs) |
 | Setup state and session lifecycle | [`SetupStateStore.cs`](../src/OpenClaw.Launcher/Session/SetupStateStore.cs), [`SessionRuntime.cs`](../src/OpenClaw.Launcher/Session/SessionRuntime.cs), [`SessionCoordinator.cs`](../src/OpenClaw.Launcher/Session/SessionCoordinator.cs), [`SessionExecutor.cs`](../src/OpenClaw.Launcher/Session/SessionExecutor.cs) |
 | Guest protocol and helper staging | [`OpenClaw.SessionHost/Program.cs`](../src/OpenClaw.SessionHost/Program.cs), [`SessionLaunchProtocol.cs`](../src/OpenClaw.SessionProtocol/SessionLaunchProtocol.cs), [`SessionHelperStager.cs`](../src/OpenClaw.Launcher/Session/SessionHelperStager.cs) |
-| MXC runtime and wire boundary | [`mxc-runtime.lock.json`](../mxc-runtime.lock.json), [`Get-MxcRuntime.ps1`](../scripts/Get-MxcRuntime.ps1), [`MxcRuntimeLocator.cs`](../src/OpenClaw.Launcher/Mxc/MxcRuntimeLocator.cs), [`MxcCliSessionClient.cs`](../src/OpenClaw.Launcher/Mxc/MxcCliSessionClient.cs), [`MxcWireProtocol.cs`](../src/OpenClaw.Launcher/Mxc/MxcWireProtocol.cs) |
+| MXC SDK API and redistribution notice | [`Directory.Packages.props`](../Directory.Packages.props), [`Get-MxcSdkMetadata.ps1`](../scripts/Get-MxcSdkMetadata.ps1), [`MxcRuntimeLocator.cs`](../src/OpenClaw.Launcher/Mxc/MxcRuntimeLocator.cs), [`MxcSdkSessionClient.cs`](../src/OpenClaw.Launcher/Mxc/MxcSdkSessionClient.cs) |
 | Agent runtime installation | [`SessionRuntimeInstaller.cs`](../src/OpenClaw.SessionHost/SessionRuntimeInstaller.cs) |
 | Gateway lifecycle | [`SchTasksGatewayScheduler.cs`](../src/OpenClaw.Launcher/Gateway/SchTasksGatewayScheduler.cs), [`GatewayController.cs`](../src/OpenClaw.Launcher/Gateway/GatewayController.cs), [`GatewayConfigurationStore.cs`](../src/OpenClaw.Launcher/Gateway/GatewayConfigurationStore.cs) |
 | Diagnostics and payload integrity | [`HostDiagnosticLog.cs`](../src/OpenClaw.Launcher/HostDiagnosticLog.cs), [`HostEnvironment.cs`](../src/OpenClaw.Launcher/HostEnvironment.cs), [`DiagnosticFailure.cs`](../src/OpenClaw.Launcher/DiagnosticFailure.cs), [`DiagnosticsBundle.cs`](../src/OpenClaw.Launcher/Gateway/DiagnosticsBundle.cs), [`DiagnosticsRedactor.cs`](../src/OpenClaw.Launcher/Gateway/DiagnosticsRedactor.cs), [`Build-MSIX.ps1`](../scripts/Build-MSIX.ps1) |

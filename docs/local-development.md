@@ -45,13 +45,13 @@ runtime:
 ```
 
 `-Architecture` defaults to the device's native architecture; pass the same
-value to `-Unregister`. An x64 layout registers on an ARM64 device, but its
-`clawctl setup` fails there because the x64 MXC executor exits with
-`0xC000007B`.
+value to `-Unregister`. Prefer the device's native architecture; x64
+emulation on ARM64 needs separate SDK/backend qualification.
 
-The script resolves a payload, stages MXC and the bundled Node.js runtime,
+The script resolves a payload and the bundled Node.js runtime,
 publishes both the NativeAOT `openclaw.exe` launcher and the NativeAOT session
-host, assembles the layout, registers it with `Add-AppxPackage -Register`, and
+host, copies normal publish assets and the SDK redistribution notice, assembles the layout,
+registers it with `Add-AppxPackage -Register`, and
 runs setup through that identity's control application. The patch registers
 beside the base package as `openclaw-pwsh-exec` and `clawctl-pwsh-exec`, so
 iteration never replaces the base `openclaw` and `clawctl` or their app data.
@@ -88,12 +88,13 @@ two content-hash fingerprints:
 - The build-input fingerprint covers the launcher, session-host, and protocol
   project files other than `bin` and `obj`, `Directory.Build.props`,
   `Directory.Packages.props`, `global.json`, the checkout commit, the payload
-  identity, and the manifest, images, Node.js scripts, and staged MXC runtime.
+  identity, the manifest, images, and Node.js scripts.
   The package version is compiled into the launcher, so this fingerprint picks
   the version before publishing: a changed deployment publishes the NativeAOT
   launcher once, with the version it registers.
 - The output fingerprint, which includes the SHA-256 hashes of the published
-  launcher and session host, alone decides that the package is current. A
+  launcher and session host, decides that the package is current. SDK runtime
+  assets are opaque publish output, not a separate inspected inventory. A
   publish can refresh timestamps without changing code, so timestamps would
   spuriously redeploy the layout. When the build inputs match but the binaries
   changed anyway, for example after an SDK update, the command rebuilds the
@@ -451,6 +452,13 @@ For ordinary managed-code changes, use the contributor quality and test lanes:
 dotnet test .\OpenClaw.Gateway.MSIX.slnx --configuration Release --no-restore
 ```
 
+The branch-local invocation-job prototype's `InvocationCancellationTests`
+exercise real helper/process trees only in temporary fixtures, including
+retained job handles, cancellation, deadlines, and sibling survival.
+They never provision an isolated account. The separately callable disposable
+MXC probe is not part of this lane; running it requires explicit authorization
+and exact-ID cleanup with independent account/profile/workspace verification.
+
 For CodeQL configuration changes, use the
 [CodeQL analysis suite](../CONTRIBUTING.md#codeql-analysis). It requires a CodeQL
 bundle and checks actual source selection; managed and NativeAOT tests do not
@@ -499,6 +507,14 @@ NativeAOT-sensitive code, also run:
 ```powershell
 .\scripts\Test-NativeAotCli.Tests.ps1
 ```
+
+Use `-Architecture arm64` on a host that can execute ARM64 output. The driver
+also loads the actual SDK native unit and dry-runs typed provision and
+legacy-ID lifecycle requests; it never creates an isolated account.
+
+`-RuntimeImagePreflightOnly` selects native alias identity and fixture-owned
+corrupt-runtime repair without SDK discovery or backend calls. It proves that
+focused repair path under NativeAOT, not the full native gate.
 
 JIT build and xUnit results are insufficient: the test host cannot expose the
 native `argv[0]` alias/root-command behavior, and a successful publish does not

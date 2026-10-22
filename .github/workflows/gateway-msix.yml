@@ -253,7 +253,7 @@ jobs:
 
       - name: Test MXC packaging inputs
         shell: pwsh
-        run: .\scripts\Test-Get-MxcRuntime.Tests.ps1
+        run: .\scripts\Test-Get-MxcSdkMetadata.Tests.ps1
 
       - name: Test Microsoft Store submission
         shell: pwsh
