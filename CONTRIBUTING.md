@@ -77,6 +77,7 @@ or package version logic:
 .\scripts\Test-WorkflowSigningConfiguration.ps1
 .\scripts\Test-MSIXUpgradeMatrix.Tests.ps1
 .\scripts\Test-WorkflowPackageVersion.Tests.ps1
+.\scripts\Test-Submit-MicrosoftStore.Tests.ps1
 .\scripts\Test-GitHooks.Tests.ps1
 ```
 

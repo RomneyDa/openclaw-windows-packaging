@@ -248,3 +248,7 @@ Cache alerts remain open unless the fresh scan closes them or separately
 authorized disposition is backed by actual platform denial evidence.
 Cache deletion, dispatch, alert disposition, signing, and publication are
 separate authorized operations, not part of local implementation validation.
+
+## Automated Store submission
+
+See [Microsoft Store submission](microsoft-store.md) for protected OIDC setup, manual submission from an existing release run, automatic activation, and recovery. Automatic submission remains off until the repository variable `MSSTORE_ENABLED` is `true`; the existing release and artifact handoffs are unchanged.
