@@ -15,6 +15,9 @@ namespace OpenClaw.Launcher;
 internal interface IInvocationLifetime : IDisposable
 {
     string Mode { get; }
+
+    /// <summary>The coordinator mode for a state-transfer helper request.</summary>
+    string StateTransferMode { get; }
     void MarkDispatched();
     void RequestStop();
     void ForegroundExited();
@@ -25,6 +28,8 @@ internal sealed class WindowsInvocationJob : IInvocationLifetime
 {
     internal const string ModePrefix = "--request-in-job=";
     internal const string CoordinatorModePrefix = "--coordinate-invocation=";
+    internal const string StateTransferModePrefix = "--state-transfer-in-job=";
+    internal const string StateTransferCoordinatorModePrefix = "--coordinate-state-transfer=";
     private const string NamePrefix = @"Global\OpenClaw.Invocation.";
     private readonly SafeFileHandle _job;
     private readonly EventWaitHandle _stopping;
@@ -43,12 +48,15 @@ internal sealed class WindowsInvocationJob : IInvocationLifetime
 
     public string Mode { get; }
 
+    public string StateTransferMode { get; }
+
     private WindowsInvocationJob(
         string id, SafeFileHandle job, EventWaitHandle stopping,
         EventWaitHandle completed, EventWaitHandle pinned,
         EventWaitHandle terminated, EventWaitHandle drained)
     {
         Mode = CoordinatorModePrefix + id;
+        StateTransferMode = StateTransferCoordinatorModePrefix + id;
         _job = job;
         _stopping = stopping;
         _completed = completed;
@@ -66,8 +74,7 @@ internal sealed class WindowsInvocationJob : IInvocationLifetime
         string owner = identity.User!.Value;
         string id = Guid.NewGuid().ToString("N");
         string name = NamePrefix + id;
-        using var jobSecurity = new ObjectSecurity(
-            $"D:P(A;;GA;;;{owner})(A;;0x0005;;;{agentSid})");
+        using var jobSecurity = new ObjectSecurity(AccessDescriptor(owner, agentSid, 0x0005));
         SafeFileHandle? job = null;
         EventWaitHandle? stopping = null;
         EventWaitHandle? completed = null;
@@ -121,6 +128,22 @@ internal sealed class WindowsInvocationJob : IInvocationLifetime
         mode.StartsWith(CoordinatorModePrefix, StringComparison.Ordinal) &&
         Guid.TryParseExact(mode.AsSpan(CoordinatorModePrefix.Length), "N", out _);
 
+    internal static bool IsStateTransferMode(string mode) =>
+        mode.StartsWith(StateTransferModePrefix, StringComparison.Ordinal) &&
+        Guid.TryParseExact(mode.AsSpan(StateTransferModePrefix.Length), "N", out _);
+
+    internal static bool IsStateTransferCoordinatorMode(string mode) =>
+        mode.StartsWith(StateTransferCoordinatorModePrefix, StringComparison.Ordinal) &&
+        Guid.TryParseExact(mode.AsSpan(StateTransferCoordinatorModePrefix.Length), "N", out _);
+
+    // The invocation identifier a coordinator or worker mode carries.
+    internal static string InvocationId(string mode) =>
+        IsCoordinatorMode(mode) ? mode[CoordinatorModePrefix.Length..] :
+        IsStateTransferCoordinatorMode(mode) ? mode[StateTransferCoordinatorModePrefix.Length..] :
+        IsMode(mode) ? mode[ModePrefix.Length..] :
+        IsStateTransferMode(mode) ? mode[StateTransferModePrefix.Length..] :
+        throw new InvalidOperationException("Invalid invocation job mode.");
+
     public void MarkDispatched()
     {
         lock (_gate)
@@ -145,11 +168,11 @@ internal sealed class WindowsInvocationJob : IInvocationLifetime
     // The outside coordinator separately opens QUERY, never TERMINATE.
     internal static void Join(string mode)
     {
-        if (!IsMode(mode))
+        if (!IsMode(mode) && !IsStateTransferMode(mode))
         {
             throw new InvalidOperationException("Invalid invocation job mode.");
         }
-        string name = NamePrefix + mode[ModePrefix.Length..];
+        string name = NamePrefix + InvocationId(mode);
         using SafeFileHandle job = OpenJobObjectW(0x0001, false, name);
         if (job.IsInvalid)
         {
@@ -291,7 +314,7 @@ internal sealed class WindowsInvocationJob : IInvocationLifetime
 
     private static EventWaitHandle CreateEvent(string name, string owner, string agentSid, uint access)
     {
-        using var security = new ObjectSecurity($"D:P(A;;GA;;;{owner})(A;;0x{access:X8};;;{agentSid})");
+        using var security = new ObjectSecurity(AccessDescriptor(owner, agentSid, access));
         SafeWaitHandle handle = CreateEventW(ref security.Attributes, true, false, name);
         if (handle.IsInvalid)
         {
@@ -304,6 +327,15 @@ internal sealed class WindowsInvocationJob : IInvocationLifetime
 
     private static Win32Exception Failure(string operation) =>
         new(Marshal.GetLastWin32Error(), $"Unable to {operation}.");
+
+    // An unlabeled object takes its creator's integrity level, so an elevated
+    // launcher would stamp High no-write-up on the job and events and the
+    // Medium-integrity agent could not assign itself or signal them. The DACL
+    // already limits access to the owner and the agent; the explicit Medium
+    // label keeps the integrity check from overriding it. Lowering a label to
+    // at most the caller's own level needs no privilege.
+    internal static string AccessDescriptor(string owner, string agentSid, uint agentAccess) =>
+        $"D:P(A;;GA;;;{owner})(A;;0x{agentAccess:X8};;;{agentSid})S:(ML;;NW;;;ME)";
 
     [StructLayout(LayoutKind.Sequential)]
     private struct SecurityAttributes

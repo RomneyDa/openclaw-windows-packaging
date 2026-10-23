@@ -210,7 +210,13 @@ This is ordinary process-leak control, not an authorization boundary against
 hostile same-identity code. Explicit termination does not depend on the last
 job handle closing; kill-on-close remains only a host-death fallback and is not
 guaranteed against retained handles. Older helpers reject the new
-`--coordinate-invocation=<id>` mode without starting a workload. The JSON
+`--coordinate-invocation=<id>` mode without starting a workload. State-transfer
+workers (backup, restore, recovery) use the same lifetime through the paired
+`--coordinate-state-transfer=<id>` and `--state-transfer-in-job=<id>` modes, so
+Ctrl+C stops the exact worker tree before the exchange files are released; a
+cancelled restore whose prepare step already recorded its activation is rolled
+back automatically. The other helper modes (runtime/tool installation,
+inspection, collection, configuration checks) still run as plain executions. The JSON
 protocol version is unchanged; the branch-local modes and events require a
 matching host/helper. Local regressions, managed quality, the full Release
 suite, and the observed cross-identity NativeAOT scenarios pass; the remaining
@@ -230,6 +236,11 @@ runs inside the isolated agent and extracts Node into that account's profile,
 not the package host's LocalState. The two identities do not share readable
 per-account package state. Extraction by the account that will execute Node
 also gives that account ownership of the extracted files.
+
+Runtime reuse checks executable PE headers before entering the Windows loader.
+A corrupt non-executable runtime is repaired from the selected package archive
+instead of reaching `Process.Start`, whose creation wait precedes the process
+exit timeout. This does not add a packaging-owned Node.js version policy.
 
 The installer version-checks the extracted runtime and can prepend its runtime
 directory to the agent user's `PATH`. Launch requests also carry a
@@ -372,6 +383,77 @@ Companion verifies the live listener and checks that the agent's port and token
 still match its setup record. It matches the pending request to its own device
 ID and public key, then approves only that exact request.
 
+## State transfer preserves the current session identity
+
+[`StateTransferCoordinator`](../src/OpenClaw.Launcher/StateTransfer/StateTransferCoordinator.cs)
+owns host-side backup, restore, and recovery orchestration. It requires ready
+setup, starts only the recorded session, binds exchanges to its generation, and
+uses its staged helper and agent-owned Node.js runtime. The archive store
+publishes hash/length-checked files without overwriting an existing destination.
+Listing that store does not contact MXC.
+Archive files receive a protected DACL when their handle is created, before
+credential bytes are written; inherited readers of the archive folder do not
+gain access. The shared `TrustedPath` owner also creates the per-command
+exchange for the invoking user and recorded agent, excluding broad parent
+readers. Upstream scratch remains in that private exchange. Guest transaction
+and normalization roots are private to the agent, SYSTEM, and administrators.
+Existing folder, profile, and archive permissions are not rewritten.
+
+[`SessionStateTransfer`](../src/OpenClaw.SessionHost/SessionStateTransfer.cs)
+owns guest preparation, activation, and rollback.
+[`StateArchiveApplication`](../src/OpenClaw.SessionHost/StateArchiveApplication.cs)
+invokes immutable packaged OpenClaw for inventory, canonical SQLite snapshots,
+verification, and fresh-target extraction. It inspects configuration through
+the upstream SDK and relocates only declared filesystem fields and `$include`
+documents in staging, never arbitrary credential/history strings. Missing,
+external, relative, or environment-dependent required paths remain explicit
+automatic-recovery refusals. Windows/profile portability is not account or
+package migration.
+
+Restore verifies and prepares before asking the existing gateway owner to stop
+the managed gateway. It acquires exclusive state access, captures and retains
+verified current-state protection, and only then requests activation. Asset
+roots are collapsed to non-overlapping profile-relative mappings. A durable,
+source-generated journal outside `.openclaw` records the current profile
+identity, transaction, prepared-tree digest, asset identities, protection, and
+progress before same-volume moves. Activation rechecks the prepared contents
+before moving any original data. Rollback reconciles recorded identities with the moved
+objects, including interruption between a move and its next host response.
+It does not terminate an unrelated process or treat journal paths as
+unrestricted authority. Backend/setup identity is never replaced.
+
+[`SessionStateAccess`](../src/OpenClaw.SessionHost/SessionStateAccess.cs)
+owns one required cross-process access gate. Intent blocks new attached
+launches, detached supervision, PowerShell, and configuration writers;
+existing readers must finish before maintenance can obtain exclusive access.
+A separate worker lease prevents rollback while an activation worker remains
+alive. Kernel-released leases provide liveness without trusting a reusable PID.
+The helpers own child process trees in kill-on-close jobs so a lease cannot end
+while their descendants keep writing; disposing such a job closes admission, pins
+every member by handle, terminates it, and waits on each pinned handle (not job
+accounting) before the lease is released. A member that outlives termination
+fails the operation; the state leases still unwind with that error, which is
+deliberate fail-closed behavior rather than an unkillable process blocking every
+later maintenance operation. The supervised gateway's job is published under a
+name bound to its supervisor, so a stop that kills the supervisor still waits out
+the whole gateway tree before it reports success. Inspection and diagnostics remain
+available when activation is pending. Successful activation or explicit
+rollback clears intent; an unreadable journal fails closed. Finalized state
+remains finalized if deleting disposable transaction data or a private recovery
+snapshot fails: the result names the retained directory in a cleanup warning
+instead of falsely reporting interrupted activation. Retained archives are
+not part of that cleanup.
+
+Recovery's host-side
+[`RecoverySource`](../src/OpenClaw.Launcher/StateTransfer/RecoverySource.cs)
+reads only an explicitly selected old profile. It pins source identities,
+refuses writable/locked files and reparse points, checks inventory stability,
+and carries required profile-contained dependencies into a shadow profile.
+The guest preserves WAL bytes in that shadow copy before invoking the upstream
+canonical producer. The verified recovery archive is retained first, then fed
+through ordinary restore. Neither recovery nor rollback recreates an old
+Windows account, changes ACLs, provisions a new session, or restarts the gateway.
+
 ## Diagnostics and build inputs have different trust roles
 
 [`HostDiagnosticLog`](../src/OpenClaw.Launcher/HostDiagnosticLog.cs) writes
@@ -460,6 +542,7 @@ flowchart LR
 | Setup state and session lifecycle | [`SetupStateStore.cs`](../src/OpenClaw.Launcher/Session/SetupStateStore.cs), [`SessionRuntime.cs`](../src/OpenClaw.Launcher/Session/SessionRuntime.cs), [`SessionCoordinator.cs`](../src/OpenClaw.Launcher/Session/SessionCoordinator.cs), [`SessionExecutor.cs`](../src/OpenClaw.Launcher/Session/SessionExecutor.cs) |
 | Guest protocol and helper staging | [`OpenClaw.SessionHost/Program.cs`](../src/OpenClaw.SessionHost/Program.cs), [`SessionLaunchProtocol.cs`](../src/OpenClaw.SessionProtocol/SessionLaunchProtocol.cs), [`SessionHelperStager.cs`](../src/OpenClaw.Launcher/Session/SessionHelperStager.cs) |
 | MXC SDK API and redistribution notice | [`Directory.Packages.props`](../Directory.Packages.props), [`Get-MxcSdkMetadata.ps1`](../scripts/Get-MxcSdkMetadata.ps1), [`MxcRuntimeLocator.cs`](../src/OpenClaw.Launcher/Mxc/MxcRuntimeLocator.cs), [`MxcSdkSessionClient.cs`](../src/OpenClaw.Launcher/Mxc/MxcSdkSessionClient.cs) |
+| State transfer and activation | [`SessionStateTransferProtocol.cs`](../src/OpenClaw.SessionProtocol/SessionStateTransferProtocol.cs), [`StateTransferCoordinator.cs`](../src/OpenClaw.Launcher/StateTransfer/StateTransferCoordinator.cs), [`SessionStateTransfer.cs`](../src/OpenClaw.SessionHost/SessionStateTransfer.cs), [`SessionStateAccess.cs`](../src/OpenClaw.SessionHost/SessionStateAccess.cs), [`StateActivationJournal.cs`](../src/OpenClaw.SessionHost/StateActivationJournal.cs) |
 | Agent runtime installation | [`SessionRuntimeInstaller.cs`](../src/OpenClaw.SessionHost/SessionRuntimeInstaller.cs) |
 | Gateway lifecycle | [`SchTasksGatewayScheduler.cs`](../src/OpenClaw.Launcher/Gateway/SchTasksGatewayScheduler.cs), [`GatewayController.cs`](../src/OpenClaw.Launcher/Gateway/GatewayController.cs), [`GatewayConfigurationStore.cs`](../src/OpenClaw.Launcher/Gateway/GatewayConfigurationStore.cs) |
 | Diagnostics and payload integrity | [`HostDiagnosticLog.cs`](../src/OpenClaw.Launcher/HostDiagnosticLog.cs), [`HostEnvironment.cs`](../src/OpenClaw.Launcher/HostEnvironment.cs), [`DiagnosticFailure.cs`](../src/OpenClaw.Launcher/DiagnosticFailure.cs), [`DiagnosticsBundle.cs`](../src/OpenClaw.Launcher/Gateway/DiagnosticsBundle.cs), [`DiagnosticsRedactor.cs`](../src/OpenClaw.Launcher/Gateway/DiagnosticsRedactor.cs), [`Build-MSIX.ps1`](../scripts/Build-MSIX.ps1) |
