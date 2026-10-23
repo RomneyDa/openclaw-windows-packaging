@@ -245,20 +245,21 @@ public sealed class SetupOrchestratorTests : IDisposable
             applicationDirectory);
     }
 
-    private Task<SetupEnsureOutcome> EnsureAsync(
+    private async Task<SetupEnsureOutcome> EnsureAsync(
         HostOptions options,
         string applicationDirectory,
         SessionRuntime runtime,
         StubLifecycle lifecycle)
     {
-        return SetupOrchestrator.EnsureAsync(
+        SetupEnsureResult result = await SetupOrchestrator.EnsureAsync(
             options,
             runtime,
             lifecycle,
             applicationDirectory,
             _ => { },
             new NoProgress(),
-            CancellationToken.None);
+            CancellationToken.None).ConfigureAwait(false);
+        return result.Outcome;
     }
 
     private SessionRuntime CreateRuntime(ISessionLock? lifecycleLock = null)

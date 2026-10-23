@@ -265,7 +265,9 @@ are enabled. Background recovery requires those Windows components.
 
 **Check.** `clawctl status` reports recovery as needing attention (and exits 1),
 and `clawctl setup` finishes with exit 0 but shows its Recovery line as needing
-attention. Both name the registry value that turns the host off:
+attention. The automatic setup that a first `openclaw` runs prints the same
+Recovery section on standard error after its progress lines, and the command
+still runs. Each names the registry value that turns the host off:
 `HKEY_LOCAL_MACHINE` or `HKEY_CURRENT_USER`, under
 `SOFTWARE\Microsoft\Windows Script Host\Settings`, value `Enabled` set to `0`.
 Both recovery lanes run through `wscript.exe`. With the host disabled, Windows
