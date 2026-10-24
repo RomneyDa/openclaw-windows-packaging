@@ -1314,6 +1314,224 @@ public sealed class ProgramTests : IDisposable
         Assert.DoesNotContain("Finalizing setup.", result, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData("Ready")]
+    [InlineData("Preparing")]
+    [InlineData("TearingDown")]
+    [InlineData("Unreadable")]
+    [InlineData("ForeignIdentity")]
+    [InlineData("UnsupportedSchema")]
+    public async Task SetupPreservesSurvivingEvidenceWhenTheSessionRecordIsMissing(string state)
+    {
+        SessionRuntime runtime = await SetUpSessionAsync().ConfigureAwait(true);
+        File.Delete(runtime.Paths.SessionStatePath);
+        SetupRecord marker = runtime.SetupState.Read(runtime.ApplicationId).Record!;
+        if (Enum.TryParse(state, out SetupPhase phase))
+        {
+            runtime.SetupState.Write(marker with { Phase = phase });
+        }
+        else if (state == "ForeignIdentity")
+        {
+            runtime.SetupState.Write(marker with { ApplicationId = "PFN:SomeoneElse_test" });
+        }
+        else
+        {
+            await File.WriteAllTextAsync(
+                runtime.Paths.SetupStatePath,
+                state == "Unreadable" ? "{ not json" : """{"schemaVersion":999}""")
+                .ConfigureAwait(true);
+        }
+
+        byte[] evidence = await File.ReadAllBytesAsync(runtime.Paths.SetupStatePath).ConfigureAwait(true);
+        var backend = (FakeMxcSessionClient)runtime.Backend;
+        backend.Calls.Clear();
+        using var output = new StringWriter();
+
+        int exitCode = await Program.RunControlAsync(
+            CreateSetupOptions(Path.Combine(_testDirectory, "app")),
+            ["setup", "--json"],
+            _ => { },
+            output,
+            output,
+            installationLifecycle: new FailingFreshLifecycle(runtime)).ConfigureAwait(true);
+
+        Assert.Equal(1, exitCode);
+        Assert.Empty(backend.Calls);
+        Assert.Equal(evidence, await File.ReadAllBytesAsync(runtime.Paths.SetupStatePath).ConfigureAwait(true));
+        Assert.Equal(SessionStateFault.Missing, runtime.Coordinator.GetRecordedStatus().Fault);
+        using JsonDocument result = JsonDocument.Parse(output.ToString());
+        string error = result.RootElement.GetProperty("error").GetProperty("message").GetString()!;
+        Assert.Contains("setup evidence remains", error, StringComparison.Ordinal);
+        Assert.Contains("clawctl setup --fresh --force", error, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FreshSetupWithMissingOwnershipRequiresForceAndRetainsResidualLocator(bool force)
+    {
+        SessionRuntime runtime = await SetUpSessionAsync().ConfigureAwait(true);
+        string oldSandboxId = runtime.SetupState.Read(runtime.ApplicationId).Record!.SandboxId!;
+        File.Delete(runtime.Paths.SessionStatePath);
+        byte[] evidence = await File.ReadAllBytesAsync(runtime.Paths.SetupStatePath).ConfigureAwait(true);
+        var backend = (FakeMxcSessionClient)runtime.Backend;
+        backend.Calls.Clear();
+        var scheduler = new Gateway.FakeGatewayTaskScheduler();
+        var lifecycle = new FailingFreshLifecycle(runtime)
+        {
+            Teardown = CreateTeardownOrchestrator(runtime, _ => { }, scheduler),
+            StateCleaner = new InstallationStateCleaner(
+                runtime.Paths,
+                Path.Combine(_testDirectory, "product-state"))
+        };
+        using var output = new StringWriter();
+        var logs = new List<string>();
+
+        int exitCode = await Program.RunControlAsync(
+            CreateSetupOptions(Path.Combine(_testDirectory, "app")),
+            force ? ["setup", "--fresh", "--force"] : ["setup", "--fresh"],
+            logs.Add,
+            output,
+            output,
+            installationLifecycle: lifecycle).ConfigureAwait(true);
+
+        Assert.Empty(scheduler.Calls);
+        Assert.DoesNotContain(backend.Calls, call => call.Contains(oldSandboxId, StringComparison.Ordinal));
+        string report = await File.ReadAllTextAsync(runtime.Paths.PreResetReportPath).ConfigureAwait(true);
+        Assert.Contains($"setupSandboxId={oldSandboxId}", report, StringComparison.Ordinal);
+        Assert.Contains("sessionRecordFault=Missing", report, StringComparison.Ordinal);
+        if (force)
+        {
+            Assert.Equal(0, exitCode);
+            Assert.NotEqual(oldSandboxId, runtime.SetupState.Read(runtime.ApplicationId).Record!.SandboxId);
+            Assert.Contains("provision", backend.Calls);
+            Assert.Contains("could not confirm external cleanup", output.ToString(), StringComparison.Ordinal);
+            Assert.Contains(logs, line => line.Contains("did not prove a pristine machine", StringComparison.Ordinal));
+        }
+        else
+        {
+            Assert.Equal(1, exitCode);
+            Assert.Empty(backend.Calls);
+            Assert.Equal(evidence, await File.ReadAllBytesAsync(runtime.Paths.SetupStatePath).ConfigureAwait(true));
+            Assert.DoesNotContain("clean", lifecycle.Calls);
+        }
+    }
+
+    [Fact]
+    public async Task SetupRetriesAfterProvisioningFailedBeforeASessionWasRecorded()
+    {
+        string applicationDirectory = await CreateApplicationAsync().ConfigureAwait(true);
+        SessionRuntime runtime = await FailSetupDuringProvisioningAsync(applicationDirectory)
+            .ConfigureAwait(true);
+
+        int exitCode = await Program.RunControlAsync(
+            CreateSetupOptions(applicationDirectory),
+            ["setup"],
+            _ => { },
+            TextWriter.Null,
+            TextWriter.Null,
+            installationLifecycle: new FailingFreshLifecycle(runtime)).ConfigureAwait(true);
+
+        Assert.Equal(0, exitCode);
+        SetupRecord marker = runtime.SetupState.Read(runtime.ApplicationId).Record!;
+        Assert.Equal(SetupPhase.Ready, marker.Phase);
+        Assert.Equal(runtime.Coordinator.GetRecordedStatus().Record!.SandboxId, marker.SandboxId);
+    }
+
+    [Fact]
+    public async Task TeardownClearsSetupThatFailedBeforeRecordingASession()
+    {
+        string applicationDirectory = await CreateApplicationAsync().ConfigureAwait(true);
+        SessionRuntime runtime = await FailSetupDuringProvisioningAsync(applicationDirectory)
+            .ConfigureAwait(true);
+        var backend = (FakeMxcSessionClient)runtime.Backend;
+        backend.Calls.Clear();
+        TeardownOrchestrator orchestrator = CreateTeardownOrchestrator(
+            runtime,
+            _ => { },
+            new Gateway.FakeGatewayTaskScheduler());
+
+        TeardownResult result = await orchestrator.RunAsync(
+            runtime.HelperPath,
+            force: true,
+            CancellationToken.None).ConfigureAwait(true);
+
+        Assert.True(result.Succeeded);
+        Assert.False(result.SessionRemoved);
+        Assert.Equal(SetupStateFault.Missing, runtime.SetupState.Read(runtime.ApplicationId).Fault);
+        Assert.Empty(backend.Calls);
+    }
+
+    [Fact]
+    public async Task OpenNamesSurvivingSetupEvidenceWhenTheSessionRecordIsMissing()
+    {
+        SessionRuntime runtime = await SetUpSessionAsync().ConfigureAwait(true);
+        File.Delete(runtime.Paths.SessionStatePath);
+        var backend = (FakeMxcSessionClient)runtime.Backend;
+        backend.Calls.Clear();
+        using var output = new StringWriter();
+
+        int exitCode = await Program.RunControlAsync(
+            new HostOptions(null, null, []),
+            ["open"],
+            _ => { },
+            output,
+            TextWriter.Null,
+            installationLifecycle: new FailingFreshLifecycle(runtime),
+            launchBrowserAsync: _ => Task.CompletedTask).ConfigureAwait(true);
+
+        string text = FlattenRenderedText(output.ToString());
+        Assert.Equal(1, exitCode);
+        Assert.Contains("setup evidence remains", text, StringComparison.Ordinal);
+        Assert.Contains("clawctl setup --fresh --force", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("No session has been recorded", text, StringComparison.Ordinal);
+        Assert.Empty(backend.Calls);
+    }
+
+    [Fact]
+    public async Task StatusNamesSurvivingSetupEvidenceInsteadOfSuggestingSetup()
+    {
+        SessionRuntime runtime = await SetUpSessionAsync().ConfigureAwait(true);
+        File.Delete(runtime.Paths.SessionStatePath);
+        using var output = new StringWriter();
+
+        await Program.RunControlAsync(
+            new HostOptions(null, null, []),
+            ["status"],
+            _ => { },
+            output,
+            TextWriter.Null,
+            installationLifecycle: new FailingFreshLifecycle(runtime)).ConfigureAwait(true);
+
+        string text = FlattenRenderedText(output.ToString());
+        Assert.Contains("setup evidence remains", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("Run:", text, StringComparison.Ordinal);
+    }
+
+    // Setup writes its Preparing marker before provisioning, so a provisioning
+    // failure leaves that marker with neither a sandbox ID nor a session record.
+    private async Task<SessionRuntime> FailSetupDuringProvisioningAsync(string applicationDirectory)
+    {
+        SessionRuntime runtime = CreateSessionRuntime();
+        var backend = (FakeMxcSessionClient)runtime.Backend;
+        backend.ProvisionFailure = new MxcException(MxcErrorCode.BackendError, "provisioning failed");
+
+        _ = await Assert.ThrowsAsync<MxcException>(() => Program.RunControlAsync(
+            CreateSetupOptions(applicationDirectory),
+            ["setup"],
+            _ => { },
+            TextWriter.Null,
+            TextWriter.Null,
+            installationLifecycle: new FailingFreshLifecycle(runtime))).ConfigureAwait(true);
+
+        backend.ProvisionFailure = null;
+        SetupRecord marker = runtime.SetupState.Read(runtime.ApplicationId).Record!;
+        Assert.Equal(SetupPhase.Preparing, marker.Phase);
+        Assert.Null(marker.SandboxId);
+        Assert.Equal(SessionStateFault.Missing, runtime.Coordinator.GetRecordedStatus().Fault);
+        return runtime;
+    }
+
     [Fact]
     public async Task FreshSetupStopsBeforeClearingStateWhenTeardownFails()
     {
@@ -2854,6 +3072,30 @@ public sealed class ProgramTests : IDisposable
         Assert.DoesNotContain(backend.Calls, call => call.StartsWith("deprovision:", StringComparison.Ordinal));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task TeardownPreservesTheLocatorWithoutBackendCallsWhenOwnershipIsMissing(bool force)
+    {
+        SessionRuntime runtime = await SetUpSessionAsync().ConfigureAwait(true);
+        File.Delete(runtime.Paths.SessionStatePath);
+        byte[] evidence = await File.ReadAllBytesAsync(runtime.Paths.SetupStatePath).ConfigureAwait(true);
+        var backend = (FakeMxcSessionClient)runtime.Backend;
+        backend.Calls.Clear();
+        var scheduler = new Gateway.FakeGatewayTaskScheduler();
+        TeardownOrchestrator orchestrator = CreateTeardownOrchestrator(runtime, _ => { }, scheduler);
+
+        SessionStateException failure = await Assert.ThrowsAsync<SessionStateException>(
+            () => orchestrator.RunAsync(runtime.HelperPath, force, CancellationToken.None))
+            .ConfigureAwait(true);
+
+        Assert.Equal(SessionStateFault.Missing, failure.Fault);
+        Assert.Contains("setup evidence remains", failure.Message, StringComparison.Ordinal);
+        Assert.Empty(backend.Calls);
+        Assert.Empty(scheduler.Calls);
+        Assert.Equal(evidence, await File.ReadAllBytesAsync(runtime.Paths.SetupStatePath).ConfigureAwait(true));
+    }
+
     [Fact]
     public async Task TeardownRemovesOwnedSessionAfterIdempotentRecoveryCleanup()
     {
@@ -3569,6 +3811,8 @@ public sealed class ProgramTests : IDisposable
 
         public TeardownResult? TeardownResult { get; init; }
 
+        public TeardownOrchestrator? Teardown { get; init; }
+
         public bool TeardownSucceeds { get; init; }
 
         public GatewayPersistenceInstallResult RecoveryResult { get; init; } =
@@ -3612,6 +3856,11 @@ public sealed class ProgramTests : IDisposable
             Calls.Add("session");
             TeardownCount++;
             Assert.True(lockAlreadyHeld);
+            if (Teardown is not null)
+            {
+                return Teardown.RunUnderLockAsync(runtime.HelperPath, force: true, cancellationToken);
+            }
+
             if (TeardownException is not null)
             {
                 throw TeardownException;
@@ -3635,7 +3884,9 @@ public sealed class ProgramTests : IDisposable
                 throw new SessionBusyException(TimeSpan.Zero);
             }
 
-            return new RecordingLockHandle();
+            return Teardown is not null
+                ? runtime.AcquireLifecycleLock()
+                : new RecordingLockHandle();
         }
 
         public IInstallationStateCleaner CreateStateCleaner(SessionRuntime runtime)

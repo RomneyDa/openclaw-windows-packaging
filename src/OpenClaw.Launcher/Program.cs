@@ -771,7 +771,12 @@ internal static class Program
                                 recovery,
                                 setup.Record?.AgentNodeVersion,
                                 configReadiness,
-                                stateTransfer);
+                                stateTransfer,
+                                status.Fault == Session.SessionStateFault.Missing &&
+                                    Session.SessionCoordinator.MayLocateProvision(setup)
+                                    ? Session.SessionCoordinator.DescribeUnownedSetupEvidence(
+                                        runtime.SetupState.FilePath)
+                                    : null);
                         }).ConfigureAwait(false);
                     return WriteResult(result);
                 },
