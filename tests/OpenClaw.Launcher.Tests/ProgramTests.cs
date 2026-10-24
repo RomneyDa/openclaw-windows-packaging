@@ -2530,6 +2530,134 @@ public sealed class ProgramTests : IDisposable
     }
 
     [Theory]
+    [InlineData(false, 1)]
+    [InlineData(true, 1)]
+    [InlineData(false, 64)]
+    [InlineData(true, 64)]
+    public async Task OpenReportsDashboardExitWithoutLaunchingBrowserOrLeakingCapture(
+        bool json,
+        int dashboardExitCode)
+    {
+        SessionRuntime runtime = await SetUpSessionAsync();
+        SessionRecord session = runtime.RequireSetup();
+        var backend = (FakeMxcSessionClient)runtime.Backend;
+        const string authenticatedUrl =
+            "https://127.0.0.1/control#token=synthetic-dashboard-token";
+        const string dashboardToken = "synthetic-dashboard-token";
+        const string stderrSecret = "synthetic-dashboard-stderr-secret";
+        string standardOutput =
+            $$"""{"ok":false,"reason":"fixture-dashboard-failure","browserUrl":"{{authenticatedUrl}}"}""";
+        string standardError = $"captured={stderrSecret}";
+        var logs = new List<string>();
+        bool browserLaunched = false;
+        File.WriteAllText(
+            Path.Combine(_testDirectory, "node-v24.20.0-win-x64.zip"),
+            "fixture");
+
+        runtime.GatewayState.Write(new GatewayRecord
+        {
+            SandboxId = session.SandboxId,
+            ProcessId = 42,
+            ProcessStartTimeUtc = DateTimeOffset.UtcNow,
+            HelperPath = runtime.HelperPath,
+            ObservedPorts = [],
+        });
+        backend.ExecuteBehavior = _ =>
+        {
+            string workspace = backend.Metadata!.EphemeralWorkspacePath;
+            string[] inspectionRequests = Directory.GetFiles(workspace, "inspect-*.json");
+            if (inspectionRequests.Length == 1)
+            {
+                string inspectionRequestPath = inspectionRequests[0];
+                SessionInspectRequest inspectionRequest = SessionInspectProtocol.ReadRequest(
+                    File.ReadAllText(inspectionRequestPath));
+                File.WriteAllText(
+                    SessionLaunchProtocol.ResultPathFor(inspectionRequestPath),
+                    SessionInspectProtocol.SerializeResult(new SessionInspectResult
+                    {
+                        RequestId = inspectionRequest.RequestId,
+                        ProcessFound = true,
+                        StartTimeMatches = true,
+                        PortListening = true,
+                        ListeningPorts = [],
+                        ListenerOwned = true,
+                    }));
+                return Task.FromResult(new MxcExecutionResult(0, string.Empty, string.Empty));
+            }
+
+            string requestPath = Directory.GetFiles(workspace, "launch-*.json")
+                .Single(path => !path.EndsWith(".result.json", StringComparison.Ordinal));
+            SessionLaunchRequest request = SessionLaunchProtocol.ReadRequest(
+                File.ReadAllText(requestPath));
+            File.WriteAllText(
+                SessionLaunchProtocol.ResultPathFor(requestPath),
+                SessionLaunchProtocol.SerializeResult(new SessionLaunchResult
+                {
+                    RequestId = request.RequestId,
+                    Launched = true,
+                    ExitCode = dashboardExitCode,
+                }));
+            return Task.FromResult(new MxcExecutionResult(
+                dashboardExitCode,
+                standardOutput,
+                standardError));
+        };
+        using var output = new StringWriter();
+        using var error = new StringWriter();
+
+        int exitCode = await Program.RunControlAsync(
+            new HostOptions(
+                Path.Combine(_testDirectory, "app"),
+                Path.Combine(_testDirectory, "node-v24.20.0-win-x64.zip"),
+                []),
+            json ? ["open", "--json"] : ["open"],
+            logs.Add,
+            output,
+            error,
+            installationLifecycle: new StubbedRecoveryLifecycle(runtime),
+            launchBrowserAsync: _ =>
+            {
+                browserLaunched = true;
+                return Task.CompletedTask;
+            });
+
+        string rendered = json ? output.ToString() : FlattenRenderedText(output.ToString());
+        Assert.Equal(1, exitCode);
+        Assert.False(browserLaunched);
+        if (json)
+        {
+            using JsonDocument result = JsonDocument.Parse(rendered);
+            Assert.False(result.RootElement.GetProperty("ok").GetBoolean());
+            Assert.Equal("open", result.RootElement.GetProperty("command").GetString());
+            Assert.Equal(
+                $"the OpenClaw dashboard exited with code {dashboardExitCode}",
+                result.RootElement.GetProperty("error").GetProperty("message").GetString());
+        }
+        else
+        {
+            Assert.Contains(
+                $"the OpenClaw dashboard exited with code {dashboardExitCode}",
+                rendered,
+                StringComparison.Ordinal);
+            Assert.DoesNotContain("This shouldn't happen", rendered, StringComparison.Ordinal);
+        }
+
+        string logText = string.Join(Environment.NewLine, logs);
+        Assert.DoesNotContain(authenticatedUrl, rendered, StringComparison.Ordinal);
+        Assert.DoesNotContain(dashboardToken, rendered, StringComparison.Ordinal);
+        Assert.DoesNotContain(stderrSecret, rendered, StringComparison.Ordinal);
+        Assert.DoesNotContain("fixture-dashboard-failure", rendered, StringComparison.Ordinal);
+        Assert.DoesNotContain(authenticatedUrl, error.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(dashboardToken, error.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(stderrSecret, error.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(authenticatedUrl, logText, StringComparison.Ordinal);
+        Assert.DoesNotContain(dashboardToken, logText, StringComparison.Ordinal);
+        Assert.DoesNotContain(stderrSecret, logText, StringComparison.Ordinal);
+        Assert.DoesNotContain("fixture-dashboard-failure", logText, StringComparison.Ordinal);
+        Assert.Empty(Directory.GetFiles(session.WorkspacePath!, "launch-*.json"));
+    }
+
+    [Theory]
     [InlineData(51789, 51789, 0, false, 0, 1, true)]
     [InlineData(3000, 18789, 0, false, 1, 0, true)]
     [InlineData(18789, 18789, 0, true, 1, 0, true)]

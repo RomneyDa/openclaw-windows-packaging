@@ -900,6 +900,14 @@ internal static class Program
                                 "OpenClaw dashboard",
                                 cancellationToken)
                             .ConfigureAwait(false);
+                        if (capture.ExitCode != 0)
+                        {
+                            return new OpenCommandResult(
+                                gateway.State,
+                                "The OpenClaw dashboard exited with code " +
+                                $"{capture.ExitCode.ToString(CultureInfo.InvariantCulture)}.",
+                                1);
+                        }
                         if (!Gateway.ControlUiHandoffParser.TryParse(
                                 capture.StandardOutput,
                                 gateway.Record?.ObservedPorts ?? [],
