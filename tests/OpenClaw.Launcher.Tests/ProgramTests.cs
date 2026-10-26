@@ -2538,9 +2538,6 @@ public sealed class ProgramTests : IDisposable
         bool json,
         int dashboardExitCode)
     {
-        SessionRuntime runtime = await SetUpSessionAsync();
-        SessionRecord session = runtime.RequireSetup();
-        var backend = (FakeMxcSessionClient)runtime.Backend;
         const string authenticatedUrl =
             "https://127.0.0.1/control#token=synthetic-dashboard-token";
         const string dashboardToken = "synthetic-dashboard-token";
@@ -2548,6 +2545,111 @@ public sealed class ProgramTests : IDisposable
         string standardOutput =
             $$"""{"ok":false,"reason":"fixture-dashboard-failure","browserUrl":"{{authenticatedUrl}}"}""";
         string standardError = $"captured={stderrSecret}";
+
+        DashboardExitOpenRun run = await RunOpenAfterDashboardExitAsync(
+            json,
+            dashboardExitCode,
+            standardOutput,
+            standardError);
+
+        string rendered = json ? run.Output : FlattenRenderedText(run.Output);
+        Assert.Equal(1, run.ExitCode);
+        Assert.False(run.BrowserLaunched);
+        if (json)
+        {
+            using JsonDocument result = JsonDocument.Parse(rendered);
+            Assert.False(result.RootElement.GetProperty("ok").GetBoolean());
+            Assert.Equal("open", result.RootElement.GetProperty("command").GetString());
+            Assert.Equal(
+                $"the OpenClaw dashboard exited with code {dashboardExitCode}. " +
+                "Run `clawctl collect-logs` and review the diagnostics bundle",
+                result.RootElement.GetProperty("error").GetProperty("message").GetString());
+        }
+        else
+        {
+            Assert.Contains(
+                $"the OpenClaw dashboard exited with code {dashboardExitCode}",
+                rendered,
+                StringComparison.Ordinal);
+            Assert.DoesNotContain("This shouldn't happen", rendered, StringComparison.Ordinal);
+        }
+
+        string logText = string.Join(Environment.NewLine, run.Logs);
+        Assert.DoesNotContain(authenticatedUrl, rendered, StringComparison.Ordinal);
+        Assert.DoesNotContain(dashboardToken, rendered, StringComparison.Ordinal);
+        Assert.DoesNotContain(stderrSecret, rendered, StringComparison.Ordinal);
+        Assert.DoesNotContain("fixture-dashboard-failure", rendered, StringComparison.Ordinal);
+        Assert.DoesNotContain(authenticatedUrl, run.Error, StringComparison.Ordinal);
+        Assert.DoesNotContain(dashboardToken, run.Error, StringComparison.Ordinal);
+        Assert.DoesNotContain(stderrSecret, run.Error, StringComparison.Ordinal);
+        Assert.DoesNotContain(authenticatedUrl, logText, StringComparison.Ordinal);
+        Assert.DoesNotContain(dashboardToken, logText, StringComparison.Ordinal);
+        Assert.DoesNotContain(stderrSecret, logText, StringComparison.Ordinal);
+        Assert.DoesNotContain("fixture-dashboard-failure", logText, StringComparison.Ordinal);
+        Assert.Empty(Directory.GetFiles(run.WorkspacePath, "launch-*.json"));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task OpenNamesTheDiagnosticsNextStepWhenTheDashboardExitsNonzero(bool json)
+    {
+        DashboardExitOpenRun run = await RunOpenAfterDashboardExitAsync(
+            json,
+            dashboardExitCode: 1,
+            standardOutput: """{"ok":false,"reason":"fixture-dashboard-failure"}""",
+            standardError: string.Empty);
+
+        Assert.Equal(1, run.ExitCode);
+        Assert.False(run.BrowserLaunched);
+        if (json)
+        {
+            using JsonDocument result = JsonDocument.Parse(run.Output);
+            JsonElement root = result.RootElement;
+            Assert.False(root.GetProperty("ok").GetBoolean());
+            Assert.Equal("open", root.GetProperty("command").GetString());
+            Assert.Equal("running", root.GetProperty("gateway").GetProperty("state").GetString());
+            Assert.Equal("cli_error", root.GetProperty("error").GetProperty("type").GetString());
+            Assert.Equal(
+                "the OpenClaw dashboard exited with code 1. " +
+                "Run `clawctl collect-logs` and review the diagnostics bundle",
+                root.GetProperty("error").GetProperty("message").GetString());
+        }
+        else
+        {
+            string rendered = FlattenRenderedText(run.Output);
+            Assert.Contains(
+                "the OpenClaw dashboard exited with code 1. " +
+                "Run `clawctl collect-logs` and review the diagnostics bundle.",
+                rendered,
+                StringComparison.Ordinal);
+            Assert.DoesNotContain("This shouldn't happen", rendered, StringComparison.Ordinal);
+        }
+
+        Assert.Contains(
+            "The Control UI cannot be opened: The OpenClaw dashboard exited with code 1.",
+            run.Logs);
+    }
+
+    private sealed record DashboardExitOpenRun(
+        int ExitCode,
+        string Output,
+        string Error,
+        IReadOnlyList<string> Logs,
+        bool BrowserLaunched,
+        string WorkspacePath);
+
+    // Runs `clawctl open` against a running gateway whose dashboard child the
+    // session host reports as launched and exited with the given code.
+    private async Task<DashboardExitOpenRun> RunOpenAfterDashboardExitAsync(
+        bool json,
+        int dashboardExitCode,
+        string standardOutput,
+        string standardError)
+    {
+        SessionRuntime runtime = await SetUpSessionAsync().ConfigureAwait(false);
+        SessionRecord session = runtime.RequireSetup();
+        var backend = (FakeMxcSessionClient)runtime.Backend;
         var logs = new List<string>();
         bool browserLaunched = false;
         File.WriteAllText(
@@ -2619,42 +2721,15 @@ public sealed class ProgramTests : IDisposable
             {
                 browserLaunched = true;
                 return Task.CompletedTask;
-            });
+            }).ConfigureAwait(false);
 
-        string rendered = json ? output.ToString() : FlattenRenderedText(output.ToString());
-        Assert.Equal(1, exitCode);
-        Assert.False(browserLaunched);
-        if (json)
-        {
-            using JsonDocument result = JsonDocument.Parse(rendered);
-            Assert.False(result.RootElement.GetProperty("ok").GetBoolean());
-            Assert.Equal("open", result.RootElement.GetProperty("command").GetString());
-            Assert.Equal(
-                $"the OpenClaw dashboard exited with code {dashboardExitCode}",
-                result.RootElement.GetProperty("error").GetProperty("message").GetString());
-        }
-        else
-        {
-            Assert.Contains(
-                $"the OpenClaw dashboard exited with code {dashboardExitCode}",
-                rendered,
-                StringComparison.Ordinal);
-            Assert.DoesNotContain("This shouldn't happen", rendered, StringComparison.Ordinal);
-        }
-
-        string logText = string.Join(Environment.NewLine, logs);
-        Assert.DoesNotContain(authenticatedUrl, rendered, StringComparison.Ordinal);
-        Assert.DoesNotContain(dashboardToken, rendered, StringComparison.Ordinal);
-        Assert.DoesNotContain(stderrSecret, rendered, StringComparison.Ordinal);
-        Assert.DoesNotContain("fixture-dashboard-failure", rendered, StringComparison.Ordinal);
-        Assert.DoesNotContain(authenticatedUrl, error.ToString(), StringComparison.Ordinal);
-        Assert.DoesNotContain(dashboardToken, error.ToString(), StringComparison.Ordinal);
-        Assert.DoesNotContain(stderrSecret, error.ToString(), StringComparison.Ordinal);
-        Assert.DoesNotContain(authenticatedUrl, logText, StringComparison.Ordinal);
-        Assert.DoesNotContain(dashboardToken, logText, StringComparison.Ordinal);
-        Assert.DoesNotContain(stderrSecret, logText, StringComparison.Ordinal);
-        Assert.DoesNotContain("fixture-dashboard-failure", logText, StringComparison.Ordinal);
-        Assert.Empty(Directory.GetFiles(session.WorkspacePath!, "launch-*.json"));
+        return new DashboardExitOpenRun(
+            exitCode,
+            output.ToString(),
+            error.ToString(),
+            logs,
+            browserLaunched,
+            session.WorkspacePath!);
     }
 
     [Theory]
