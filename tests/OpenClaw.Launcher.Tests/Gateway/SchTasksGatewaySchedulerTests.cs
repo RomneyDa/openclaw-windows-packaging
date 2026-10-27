@@ -44,7 +44,7 @@ public sealed class SchTasksGatewaySchedulerTests
     [InlineData(true)]
     public async Task XmlExportPreservesUnicodeAndReportsReadFailure(bool refused)
     {
-        const string taskName = @"\OpenClaw ü漢字 O'Brien $(throw 'injected')";
+        const string taskName = @"\OpenClaw ü漢字 O'Brien O’Brien ‘ + $(throw 'injected') + ’";
         const string xml = "<Task><Actions><Exec><Arguments>ü漢字 O'Brien</Arguments></Exec></Actions></Task>";
         ProcessStartInfo start = SchTasksGatewayScheduler.CreateStartInfo(
             "must-not-run-schtasks.exe", ["/Query", "/TN", taskName, "/XML", "ONE"]);

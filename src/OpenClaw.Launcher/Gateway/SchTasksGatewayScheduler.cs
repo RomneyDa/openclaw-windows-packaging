@@ -361,13 +361,14 @@ internal sealed class SchTasksGatewayScheduler : IGatewayTaskScheduler
         };
         if (exportXml)
         {
-            string taskName = arguments[2].Replace("'", "''", StringComparison.Ordinal);
+            string taskName = Convert.ToBase64String(Encoding.Unicode.GetBytes(arguments[2]));
             string script =
                 "$ErrorActionPreference = 'Stop'; " +
                 "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); " +
+                $"$taskName = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{taskName}')); " +
                 "try { $service = New-Object -ComObject 'Schedule.Service'; " +
                 "$service.Connect(); " +
-                $"[Console]::Write($service.GetFolder('\\').GetTask('{taskName}').Xml) " +
+                "[Console]::Write($service.GetFolder('\\').GetTask($taskName).Xml) " +
                 "} catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }";
             foreach (string argument in new[] { "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
                 Convert.ToBase64String(Encoding.Unicode.GetBytes(script)) })
