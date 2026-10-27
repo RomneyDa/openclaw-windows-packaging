@@ -183,7 +183,7 @@ public sealed class StateTransferScenarioTests : IDisposable
         string extracted = Path.Combine(_root, "check-repair-backup");
         _application.Extract(Current, result.Transfer.Archive.Path, extracted);
         Assert.Contains(Directory.GetFiles(extracted, "history.txt", SearchOption.AllDirectories),
-            path => File.ReadAllText(path) == "before repair");
+            path => File.ReadAllText(path) == "before repair-history");
         Assert.Equal("stopped", File.ReadAllText(GatewayMarker));
         Assert.NotNull(_doctorRequest);
         Assert.Equal([Path.Combine(_options!.PackagedApplicationDirectory!, "openclaw.mjs"),
