@@ -492,6 +492,24 @@ public sealed class StateTransferScenarioTests : IDisposable
     }
 
     [Fact]
+    public async Task RepairCancellationAfterBackupRetainsArchiveAndStoppedGateway()
+    {
+        StateTransferCoordinator coordinator = await PrepareAsync();
+        WriteProfile(Current, "before cancellation");
+        _beforeDoctor = () => throw new OperationCanceledException();
+
+        StateArchiveCommandResult result = await coordinator.RepairAsync(true, CancellationToken.None);
+
+        Assert.Equal(1, result.ExitCode);
+        Assert.Contains("Repair was cancelled", result.Error, StringComparison.Ordinal);
+        Assert.True(result.Transfer!.GatewayStopped);
+        Assert.True(File.Exists(result.Transfer.Archive!.Path));
+        Assert.Single(Store.List());
+        Assert.Equal("before cancellation-history", File.ReadAllText(Path.Combine(Current, ".openclaw", "history.txt")));
+        Assert.Equal("stopped", File.ReadAllText(GatewayMarker));
+    }
+
+    [Fact]
     public async Task PendingActivationBlocksAttachedDetachedAndCompanionWritersAtTheirEntryPoints()
     {
         StateTransferCoordinator coordinator = await PrepareAsync();
@@ -502,6 +520,11 @@ public sealed class StateTransferScenarioTests : IDisposable
             new RestoreOptions(CreateArchive(), false, true, false), CancellationToken.None);
         Assert.Equal(1, interrupted.ExitCode);
         Dictionary<string, string> pendingData = Data(Current);
+        StateArchiveCommandResult repair = await coordinator.RepairAsync(true, CancellationToken.None);
+        Assert.Equal(1, repair.ExitCode);
+        Assert.Contains("activation is pending", repair.Error, StringComparison.OrdinalIgnoreCase);
+        Assert.Null(_doctorRequest);
+        Assert.Equal(pendingData, Data(Current));
         string marker = Path.Combine(_root, "writer-started.txt");
         SessionLaunchRequest launch = new()
         {
