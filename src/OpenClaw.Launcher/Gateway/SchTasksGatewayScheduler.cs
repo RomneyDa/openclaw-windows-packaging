@@ -363,7 +363,7 @@ internal sealed class SchTasksGatewayScheduler : IGatewayTaskScheduler
         {
             string taskName = Convert.ToBase64String(Encoding.Unicode.GetBytes(arguments[2]));
             string script =
-                "$ErrorActionPreference = 'Stop'; " +
+                "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; " +
                 "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); " +
                 $"$taskName = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{taskName}')); " +
                 "try { $service = New-Object -ComObject 'Schedule.Service'; " +
