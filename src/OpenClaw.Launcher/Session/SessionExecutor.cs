@@ -441,7 +441,7 @@ internal sealed partial class SessionExecutor
                 exception is FileNotFoundException or DirectoryNotFoundException or IOException)
             {
                 throw new SessionException(
-                    "The isolated session did not report a collection result " +
+                    "The isolated session did not report a collection " +
                     DescribeMissingResult(execution),
                     exception);
             }
